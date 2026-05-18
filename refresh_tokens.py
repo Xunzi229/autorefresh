@@ -69,6 +69,10 @@ CODEX_CONSENT_URL_RE = re.compile(
     r"auth\.openai\.com/sign-in-with-chatgpt/codex/consent",
     re.I,
 )
+EMAIL_VERIFICATION_URL_RE = re.compile(
+    r"auth\.openai\.com/email-verification",
+    re.I,
+)
 BTN_ANOTHER_ACCOUNT = [
     "Use another account", "Sign in with a different account", "Log in with another account",
     "使用其他账号", "使用另一个账户", "登录其他帐户", "登录另一个账户", "使用其他帐户",
@@ -318,6 +322,19 @@ def _is_codex_consent_page(page: Page) -> bool:
     return bool(CODEX_CONSENT_URL_RE.search(page.url))
 
 
+def _is_email_verification_page(page: Page) -> bool:
+    return bool(EMAIL_VERIFICATION_URL_RE.search(page.url))
+
+
+def _wait_email_verification_page(page: Page, timeout_sec: int = 30) -> bool:
+    try:
+        page.wait_for_url(EMAIL_VERIFICATION_URL_RE, timeout=timeout_sec * 1000)
+        log("已进入邮箱验证码页 email-verification")
+        return True
+    except Exception:  # noqa: BLE001
+        return _is_email_verification_page(page)
+
+
 def _wait_codex_consent_page(page: Page, timeout_sec: int = 30) -> bool:
     try:
         page.wait_for_url(CODEX_CONSENT_URL_RE, timeout=timeout_sec * 1000)
@@ -409,6 +426,8 @@ def _consent_page_visible(page: Page) -> bool:
     """是否处于 Codex/OpenAI 授权确认页（非登录表单页）。"""
     if _is_callback_url(page.url):
         return False
+    if _is_email_verification_page(page):
+        return False
     if _is_codex_consent_page(page):
         return True
     if _email_visible(page) or _otp_visible(page):
@@ -432,6 +451,69 @@ def _consent_page_visible(page: Page) -> bool:
         pass
 
     return False
+
+
+def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
+    """邮箱验证码页提交：优先点击「继续」。"""
+    log("验证码页，点击「继续」")
+    _pause(1.5)
+
+    for loc in (
+        page.get_by_role("button", name="继续"),
+        page.get_by_role("button", name=re.compile(r"^\s*继续\s*$")),
+        page.locator('button:has-text("继续")'),
+        page.get_by_role("button", name=re.compile(r"^\s*Continue\s*$", re.I)),
+        page.locator('button:has-text("Continue")'),
+        page.locator('button[type="submit"]'),
+    ):
+        try:
+            btn = loc.first
+            btn.wait_for(state="visible", timeout=5000)
+            for _ in range(24):
+                if btn.is_enabled():
+                    break
+                _pause(0.25)
+            btn.click(timeout=timeout)
+            _pause()
+            log("已点击验证码页「继续」")
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        buttons = page.locator("button")
+        for i in range(min(buttons.count(), 25)):
+            btn = buttons.nth(i)
+            if not btn.is_visible():
+                continue
+            text = (btn.inner_text(timeout=1000) or "").strip()
+            if not text:
+                continue
+            if text in ("继续", "Continue", "Verify", "验证", "Submit", "提交") or CONSENT_BTN_RE.search(text):
+                if not btn.is_enabled():
+                    continue
+                btn.click(timeout=timeout)
+                _pause()
+                log(f"已点击验证码页按钮: {text[:24]}")
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _click_text(page, ["继续", "Continue", "Verify", "验证", "Submit", "提交"], timeout=timeout)
+
+
+def _wait_leave_email_verification(page: Page, timeout_sec: int = 20) -> bool:
+    if not _is_email_verification_page(page):
+        return True
+    try:
+        page.wait_for_function(
+            "() => !window.location.href.includes('email-verification')",
+            timeout=timeout_sec * 1000,
+        )
+        log("已离开邮箱验证码页")
+        return True
+    except Exception:  # noqa: BLE001
+        return not _is_email_verification_page(page)
 
 
 def _click_text(page: Page, texts: list[str], timeout: int = 8000) -> bool:
@@ -502,19 +584,38 @@ def _password_visible(page: Page) -> bool:
 
 
 def _otp_visible(page: Page) -> bool:
-    return (
-        _first_visible(
-            page,
-            [
-                'input[inputmode="numeric"]',
-                'input[autocomplete="one-time-code"]',
-                'input[name="code"]',
-                'input[type="tel"]',
-            ],
-            timeout=1500,
-        )
-        is not None
+    if _first_visible(
+        page,
+        [
+            'input[inputmode="numeric"]',
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[type="tel"]',
+        ],
+        timeout=1500,
+    ):
+        return True
+    # 分格 6 位验证码（无 inputmode 时）
+    loc = page.locator(
+        'input[maxlength="1"][inputmode="numeric"], '
+        'input[maxlength="1"][type="tel"], '
+        'input[autocomplete="one-time-code"]'
     )
+    try:
+        count = loc.count()
+        visible = sum(
+            1 for i in range(min(count, 8)) if loc.nth(i).is_visible()
+        )
+        return visible >= 4
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _needs_otp_step(page: Page) -> bool:
+    """场景2/3：需要填写邮箱验证码。"""
+    if _is_email_verification_page(page):
+        return True
+    return _otp_visible(page)
 
 
 def _email_visible(page: Page) -> bool:
@@ -547,41 +648,92 @@ def _fill_password(page: Page, password: str) -> bool:
         page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:  # noqa: BLE001
         _pause(2)
-    _wait_codex_consent_page(page, timeout_sec=30)
+    return True
+
+
+def _fill_split_otp_inputs(page: Page, code: str) -> bool:
+    """分格验证码（多个单字符输入框）。"""
+    loc = page.locator(
+        'input[inputmode="numeric"], input[type="tel"], input[autocomplete="one-time-code"], input[maxlength="1"]'
+    )
+    try:
+        count = loc.count()
+    except Exception:  # noqa: BLE001
+        return False
+    if count < 4:
+        return False
+
+    visible_idx: list[int] = []
+    for i in range(min(count, 8)):
+        try:
+            if loc.nth(i).is_visible():
+                visible_idx.append(i)
+        except Exception:  # noqa: BLE001
+            pass
+    if len(visible_idx) < 4:
+        return False
+
+    log(f"分格验证码输入（{len(visible_idx)} 格）")
+    for i, digit in enumerate(code):
+        if i >= len(visible_idx):
+            break
+        box = loc.nth(visible_idx[i])
+        box.click()
+        box.press_sequentially(digit, delay=TYPE_CHAR_DELAY_MS)
     return True
 
 
 def _fill_otp(page: Page, mailapi_url: str) -> bool:
-    otp_input = _first_visible(
-        page,
-        [
-            'input[inputmode="numeric"]',
-            'input[autocomplete="one-time-code"]',
-            'input[name="code"]',
-            'input[type="tel"]',
-        ],
-        timeout=3000,
-    )
-    if not otp_input:
+    on_verify_page = _is_email_verification_page(page)
+    if on_verify_page:
+        log("邮箱验证码页: email-verification")
+    elif not _otp_visible(page):
         return False
-    log("需要邮箱验证码，轮询 mailapi…")
+
+    log("轮询 mailapi 获取验证码…")
     code = fetch_email_code(mailapi_url)
     _pause()
-    _type_chars(otp_input, code)
-    _pause()
-    if not _click_text(page, BTN_SUBMIT, timeout=5000):
+
+    if _fill_split_otp_inputs(page, code):
+        _pause()
+    else:
+        otp_input = _first_visible(
+            page,
+            [
+                'input[inputmode="numeric"]',
+                'input[autocomplete="one-time-code"]',
+                'input[name="code"]',
+                'input[type="tel"]',
+                'input[type="text"]',
+            ],
+            timeout=5000 if on_verify_page else 3000,
+        )
+        if not otp_input:
+            log("未找到验证码输入框")
+            return False
+        _type_chars(otp_input, code)
+        _pause(1.5)
+
+    if not _click_otp_submit(page):
+        log("未点到「继续」，尝试 Enter")
         page.keyboard.press("Enter")
         _pause()
+    if not _wait_leave_email_verification(page, timeout_sec=20):
+        log("提交后仍在验证码页")
     return True
 
 
 def _advance_login_flow(page: Page, password: str, mailapi_url: str, *, timeout_sec: int = 180) -> None:
     """
-    根据当前页面动态处理：密码 / 验证码 / 授权继续 / 回调。
-    密码登录后可能直接进入授权页，无需验证码。
+    填完邮箱后，按页面状态推进（顺序：密码 → 验证码 → 授权）：
+
+    场景1：邮箱 + 密码 → 授权页
+    场景2：邮箱 + 邮箱验证码 → 授权页
+    场景3：邮箱 + 密码 + 邮箱验证码 → 授权页
     """
     deadline = time.time() + timeout_sec
     password_filled = False
+    otp_submitted = False
 
     while time.time() < deadline:
         try:
@@ -593,33 +745,53 @@ def _advance_login_flow(page: Page, password: str, mailapi_url: str, *, timeout_
             log("已进入 OAuth 回调")
             return
 
+        # 场景1、3：密码（优先于验证码，避免同页误判）
+        if _password_visible(page) and not password_filled:
+            if _fill_password(page, password):
+                password_filled = True
+                log("密码已提交，等待验证码页或授权页…")
+                _wait_email_verification_page(page, timeout_sec=20)
+                if not _needs_otp_step(page):
+                    _wait_codex_consent_page(page, timeout_sec=15)
+                _pause(2)
+            continue
+
+        # 场景2、3：邮箱验证码（须在授权页之前）
+        if _needs_otp_step(page) and not _is_codex_consent_page(page):
+            if otp_submitted:
+                log("验证码已填，重试点击「继续」…")
+                _click_otp_submit(page)
+                _wait_leave_email_verification(page, timeout_sec=15)
+                if not _is_email_verification_page(page):
+                    otp_submitted = False
+                    password_filled = False
+                    log("验证码页已通过，等待授权页…")
+                _pause(2)
+            elif _fill_otp(page, mailapi_url):
+                otp_submitted = True
+                password_filled = False
+                if not _is_email_verification_page(page):
+                    otp_submitted = False
+                    log("验证码已提交，等待授权页…")
+                _pause(3)
+            else:
+                log("验证码页未能填写，重试…")
+                _pause(2)
+            continue
+
+        # 场景1、2、3：授权页
         on_consent = _consent_page_visible(page)
-        if password_filled and not on_consent:
+        if password_filled and not on_consent and not _needs_otp_step(page):
             _wait_codex_consent_page(page, timeout_sec=15)
             on_consent = _consent_page_visible(page)
 
-        # 授权页优先：密码提交后 DOM 里可能仍残留密码框
-        if on_consent or password_filled or _is_codex_consent_page(page):
+        if on_consent or _is_codex_consent_page(page):
             if _click_consent_continue(page):
                 password_filled = False
                 _pause(3)
                 continue
-            if on_consent or _is_codex_consent_page(page):
-                log("Codex 授权页未点到「继续」，重试…")
-                _pause(2)
-                continue
-
-        if _password_visible(page) and not password_filled:
-            if _fill_password(page, password):
-                password_filled = True
-                log("密码已提交，等待进入授权页…")
-                _pause(3)
-            continue
-
-        if _otp_visible(page):
-            if _fill_otp(page, mailapi_url):
-                password_filled = False
-                _pause(3)
+            log("Codex 授权页未点到「继续」，重试…")
+            _pause(2)
             continue
 
         if _click_consent_continue(page):
