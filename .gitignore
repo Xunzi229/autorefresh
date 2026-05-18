@@ -1,0 +1,9 @@
+.chrome-profile/
+.codex-backup/
+accounts.json.bak
+*.json.tmp
+need_email.txt
+accounts.json
+.codex-backup
+accounts/
+__pycache__/
