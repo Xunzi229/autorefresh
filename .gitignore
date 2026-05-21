@@ -3,6 +3,7 @@
 accounts.json.bak
 *.json.tmp
 need_email.txt
+no_quota.txt
 accounts.json
 .codex-backup
 accounts/

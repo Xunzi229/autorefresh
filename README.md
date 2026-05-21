@@ -2,6 +2,23 @@
 
 自动刷新 OpenAI / Codex 账号 token 的工具集。通过 `codex login` 完成 OAuth 登录，自动填写邮箱、密码、邮箱验证码，并将新 token 写回本地多个凭证文件。
 
+## 自动拉取额度
+
+扫描 `~/.cli-proxy-api/*.json`，从 OpenAI `wham/usage` 接口拉取最新额度；`disabled: true` 的账号跳过；额度用尽的邮箱写入 `no_quota.txt`，并将对应账号 JSON 的 `disabled` 设为 `true`。**free** 账号周额度用尽后，新自然周（周一）再重检；**非 free** 账号仅 5 小时窗口用尽时每 5 小时重检，周额度用尽后等到新自然周再重检。若额度恢复则 `disabled` 改回 `false` 并从 `no_quota.txt` 移除。token 失效（401/403）的邮箱写入 `need_email.txt`，供 `./run_refresh.sh` 后续刷新 token。
+
+```bash
+./run_fetch_quota.sh
+# 指定代理（默认 http://127.0.0.1:11080，或环境变量 QUOTA_PROXY_URL）
+./run_fetch_quota.sh --proxy-url http://127.0.0.1:11080
+# 直连
+./run_fetch_quota.sh --proxy-url none
+# 仅检查指定账号
+./run_fetch_quota.sh --email xxx@outlook.com
+# 强制刷新（忽略 disabled 及重检时间）
+./run_fetch_quota.sh --force
+./run_fetch_quota.sh --force --email xxx@outlook.com
+```
+
 ## 自动刷新
 ```
 # 默认同步 ~/.cli-proxy-api/
