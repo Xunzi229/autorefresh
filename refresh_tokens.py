@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""全自动刷新 Codex token：优先 refresh_token API，失败则 codex login + 浏览器登录 + 回写 accounts.json"""
+"""全自动刷新 Codex token：优先 refresh_token API，失败则自建 OAuth PKCE + 浏览器登录 + 回写 accounts.json"""
 
 from __future__ import annotations
 
@@ -7,19 +7,21 @@ import argparse
 import atexit
 import base64
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
@@ -42,7 +44,6 @@ CLI_PROXY_DIR = Path.home() / ".cli-proxy-api"
 TZ_CN = timezone(timedelta(hours=8))
 DEFAULT_CHROME_PROFILE = SCRIPT_DIR / ".chrome-profile"
 MAC_CHROME_USER_DATA = Path.home() / "Library/Application Support/Google/Chrome"
-OAUTH_URL_RE = re.compile(r"https://auth\.openai\.com/oauth/authorize\?[^\s\]]+")
 OTP_RE = re.compile(r"\b(\d{6})\b")
 OTP_CONTEXT_PATTERNS = [
     re.compile(
@@ -60,11 +61,20 @@ ACTION_DELAY_SEC = 0.5  # 浏览器操作之间的间隔（秒）
 ACCOUNT_GAP_SEC = 10  # 每个账号刷新之间的间隔（秒）
 TYPE_CHAR_DELAY_MS = 200  # 逐字符输入间隔（毫秒）
 
-# Codex OAuth refresh（与 codex-rs/login 一致）
+# Codex OAuth（与 codex-rs/login 一致）
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OAUTH_ISSUER = "https://auth.openai.com"
 OAUTH_TOKEN_URL = os.environ.get(
-    "CODEX_REFRESH_TOKEN_URL_OVERRIDE", "https://auth.openai.com/oauth/token"
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE", f"{OAUTH_ISSUER}/oauth/token"
 )
+OAUTH_SCOPE = (
+    "openid profile email offline_access api.connectors.read api.connectors.invoke"
+)
+OAUTH_ORIGINATOR = os.environ.get("CODEX_OAUTH_ORIGINATOR", "codex_cli")
+OAUTH_CALLBACK_PORTS = (1455, 1457)
+OAUTH_CALLBACK_PATH = "/auth/callback"
+OAUTH_SUCCESS_HTML = b"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Login OK</title></head>
+<body><p>Login successful. You can close this window.</p></body></html>"""
 
 # 多语言按钮文案
 BTN_CONTINUE = [
@@ -119,9 +129,11 @@ KNOWN_AUTH_PAGE_URL_RE = re.compile(
     re.I,
 )
 BTN_ANOTHER_ACCOUNT = [
-    "登录至另一个账户", "Sign in to another account",
+    "登录至另一个帐户", "登录至另一个账户",
+    "Sign in to another account",
     "Use another account", "Sign in with a different account", "Log in with another account",
-    "使用其他账号", "使用另一个账户", "登录其他帐户", "登录另一个账户", "使用其他帐户",
+    "使用其他账号", "使用另一个帐户", "使用另一个账户",
+    "登录其他帐户", "登录其他账户", "登录另一个帐户", "登录另一个账户", "使用其他帐户",
 ]
 BTN_MFA_TRY_OTHER = [
     "尝试其他方法", "Try another method", "Use another method", "Try a different method",
@@ -131,9 +143,15 @@ BTN_MFA_EMAIL = [
 ]
 BTN_SUBMIT = ["Continue", "继续", "Log in", "登录", "Verify", "验证", "Submit", "提交", "Next", "下一步"]
 CHOOSE_ANOTHER_ACCOUNT_RE = re.compile(
-    r"登录(?:至|到)?另一个账户|登录另一个账户|使用另一个账户|登录其他账户|"
+    r"登录(?:至|到)?另一个[账帐]|登录另一个[账帐]|使用另一个[账帐]|登录其他[账帐]|"
+    r"使用其他账号|使用另一个[账帐]|使用其他[账帐]|"
     r"Sign in to another account|Use another account|Log in with another account|"
-    r"Sign in with a different account|Add another account|Add account",
+    r"Sign in with a different account",
+    re.I,
+)
+CHOOSE_ACCOUNT_EXCLUDE_RE = re.compile(
+    r"remove|delete|移除|删除|注销|登出|sign out|log out|"
+    r"forget|清除|clear|unlink|revoke|忘记|remove account|删除[账帐]户|移除[账帐]户",
     re.I,
 )
 
@@ -159,7 +177,7 @@ def _interruptible_sleep(sec: float) -> None:
 
 
 def _handle_interrupt(signum: int | None = None) -> None:
-    """还原 ~/.codex、终止 codex login，立即退出（不等待 Playwright 清理）。"""
+    """还原 ~/.codex、停止 OAuth 回调服务，立即退出（不等待 Playwright 清理）。"""
     if not _shutdown_requested.is_set():
         sig_label = signum if signum is not None else signal.SIGINT
         log(f"收到信号 {sig_label}，正在还原 ~/.codex …")
@@ -439,104 +457,250 @@ def fetch_email_code(mailapi_url: str, timeout: int = 180, interval: int = 5) ->
     raise TimeoutError(f"等待邮箱验证码超时 ({timeout}s): {last_error}")
 
 
-class CodexLoginProcess:
-    """后台保持 codex login 进程，直到 OAuth 回调结束。"""
+def _generate_pkce() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _generate_oauth_state() -> str:
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+def build_oauth_authorize_url(
+    *,
+    redirect_uri: str,
+    code_challenge: str,
+    state: str,
+) -> str:
+    params = {
+        "response_type": "code",
+        "client_id": OAUTH_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "scope": OAUTH_SCOPE,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "state": state,
+        "originator": OAUTH_ORIGINATOR,
+    }
+    return f"{OAUTH_ISSUER}/oauth/authorize?{urlencode(params)}"
+
+
+def exchange_authorization_code(
+    code: str,
+    *,
+    code_verifier: str,
+    redirect_uri: str,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """用 authorization_code + PKCE 换取 token（与 codex-rs 一致，form-urlencoded）。"""
+    resp = requests.post(
+        OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": OAUTH_CLIENT_ID,
+            "code_verifier": code_verifier,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        body = resp.text or resp.reason
+        raise RuntimeError(f"OAuth code 换 token 失败 HTTP {resp.status_code}: {body[:240]}")
+    data = resp.json()
+    for key in ("access_token", "refresh_token", "id_token"):
+        if not data.get(key):
+            raise RuntimeError(f"OAuth 响应缺少 {key}")
+    return data
+
+
+class _OAuthHTTPServer(HTTPServer):
+    allow_reuse_address = True
+    login_session: "OAuthLoginSession"
+
+
+class _OAuthCallbackHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        session = self.server.login_session  # type: ignore[attr-defined]
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == OAUTH_CALLBACK_PATH:
+            params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            if params.get("state") != session.state:
+                session.fail(RuntimeError("OAuth state 不匹配"))
+                self._respond(400, b"State mismatch")
+                return
+            if params.get("error"):
+                desc = params.get("error_description", params["error"])
+                session.fail(RuntimeError(f"OAuth 回调错误: {desc}"))
+                self._respond(400, desc.encode("utf-8", errors="replace"))
+                return
+            code = params.get("code", "").strip()
+            if not code:
+                session.fail(RuntimeError("OAuth 回调缺少 authorization code"))
+                self._respond(400, b"Missing authorization code")
+                return
+            try:
+                tokens = exchange_authorization_code(
+                    code,
+                    code_verifier=session.code_verifier,
+                    redirect_uri=session.redirect_uri,
+                )
+                session.complete(tokens)
+                log("OAuth 回调已收到，code 换 token 成功")
+            except Exception as exc:  # noqa: BLE001
+                session.fail(exc)
+                self._respond(500, str(exc).encode("utf-8", errors="replace")[:500])
+                return
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{session.port}/success")
+            self.end_headers()
+            return
+
+        if path == "/success":
+            self._respond(200, OAUTH_SUCCESS_HTML, content_type="text/html; charset=utf-8")
+            return
+
+        if path == "/cancel":
+            session.fail(KeyboardInterrupt("OAuth 登录已取消"))
+            self._respond(200, b"Login cancelled")
+            return
+
+        self._respond(404, b"Not Found")
+
+    def _respond(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class OAuthLoginSession:
+    """自建 PKCE OAuth：本地回调服务器 + code 换 token，不依赖 codex login 子进程。"""
 
     def __init__(self) -> None:
-        self.proc: subprocess.Popen[str] | None = None
-        self.oauth_url: str | None = None
-        self._output: list[str] = []
-        self._lock = threading.Lock()
-
-    def _reader(self) -> None:
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            with self._lock:
-                self._output.append(line)
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            if not self.oauth_url:
-                m = OAUTH_URL_RE.search(line)
-                if m:
-                    self.oauth_url = m.group(0).rstrip(").,]'\"")
-                    log(f"已捕获 OAuth URL")
+        self.port = OAUTH_CALLBACK_PORTS[0]
+        self.redirect_uri = ""
+        self.code_verifier = ""
+        self.code_challenge = ""
+        self.state = ""
+        self._httpd: _OAuthHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._tokens: dict[str, Any] | None = None
+        self._error: BaseException | None = None
+        self._done = threading.Event()
 
     def start(self) -> str:
-        self.proc = subprocess.Popen(
-            ["codex", "login"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+        self.code_verifier, self.code_challenge = _generate_pkce()
+        self.state = _generate_oauth_state()
+        self._httpd, self.port = self._bind_server()
+        self.redirect_uri = f"http://localhost:{self.port}{OAUTH_CALLBACK_PATH}"
+        self._httpd.login_session = self
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        oauth_url = build_oauth_authorize_url(
+            redirect_uri=self.redirect_uri,
+            code_challenge=self.code_challenge,
+            state=self.state,
         )
-        t = threading.Thread(target=self._reader, daemon=True)
-        t.start()
+        log(f"OAuth 回调监听 http://127.0.0.1:{self.port}{OAUTH_CALLBACK_PATH}")
+        return oauth_url
 
-        deadline = time.time() + 90
+    def _bind_server(self) -> tuple[_OAuthHTTPServer, int]:
+        last_err: OSError | None = None
+        for port in OAUTH_CALLBACK_PORTS:
+            try:
+                httpd = _OAuthHTTPServer(("127.0.0.1", port), _OAuthCallbackHandler)
+                return httpd, port
+            except OSError as exc:
+                last_err = exc
+        raise RuntimeError(f"无法绑定 OAuth 回调端口 {OAUTH_CALLBACK_PORTS}: {last_err}")
+
+    def complete(self, tokens: dict[str, Any]) -> None:
+        self._tokens = tokens
+        self._done.set()
+
+    def fail(self, exc: BaseException) -> None:
+        self._error = exc
+        self._done.set()
+
+    def wait_for_tokens(self, timeout: int = 300) -> dict[str, Any]:
+        deadline = time.time() + timeout
         while time.time() < deadline:
             _check_shutdown()
-            if self.oauth_url:
-                return self.oauth_url
-            if self.proc.poll() is not None:
+            if self._done.wait(timeout=min(0.5, deadline - time.time())):
                 break
-            _interruptible_sleep(0.3)
-
-        with self._lock:
-            buf = "".join(self._output)
-        raise RuntimeError(f"未能从 codex login 输出解析 OAuth URL:\n{buf}")
+        if self._error is not None:
+            raise self._error
+        if self._tokens is None:
+            raise TimeoutError(f"等待 OAuth 回调超时 ({timeout}s)")
+        return self._tokens
 
     def terminate(self) -> None:
-        if not self.proc or self.proc.poll() is not None:
-            return
-        log("终止 codex login 进程…")
-        try:
-            self.proc.terminate()
-            self.proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
-        except Exception as exc:  # noqa: BLE001
-            log(f"终止 codex login 失败: {exc}")
-
-    def wait_done(self, timeout: int = 300) -> None:
-        """等待 codex login 自然结束（回调完成），不主动 kill。"""
-        if not self.proc:
-            return
-        if _shutdown_requested.is_set():
-            self.terminate()
-            return
-        try:
-            self.proc.wait(timeout=timeout)
-            log(f"codex login 进程已结束 (code={self.proc.returncode})")
-        except subprocess.TimeoutExpired:
-            log("codex login 仍在运行（回调可能已完成，继续检查 auth.json）")
+        self.shutdown()
 
     @property
-    def alive(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+    def is_done(self) -> bool:
+        return self._done.is_set()
 
-
-def wait_for_auth(auth_path: Path, login: CodexLoginProcess, timeout: int = 300) -> dict[str, Any]:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        _check_shutdown()
-        if auth_path.exists():
+    def shutdown(self) -> None:
+        if self._httpd is not None:
             try:
-                data = json.loads(auth_path.read_text(encoding="utf-8"))
-                tokens = data.get("tokens") or {}
-                if tokens.get("access_token") or data.get("OPENAI_API_KEY"):
-                    return data
-                # chatgpt 模式：tokens 在顶层
-                if data.get("auth_mode") == "chatgpt" and tokens:
-                    return data
-            except json.JSONDecodeError:
+                self._httpd.shutdown()
+            except Exception:  # noqa: BLE001
                 pass
-        _interruptible_sleep(2)
+            self._httpd = None
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
 
-    raise TimeoutError(f"等待 {auth_path} 写入超时")
+
+def _oauth_tokens_to_auth(tokens: dict[str, Any]) -> dict[str, Any]:
+    id_token = str(tokens.get("id_token", ""))
+    account_id = _chatgpt_account_id_from_id_token(id_token)
+    return {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": tokens.get("access_token", ""),
+            "refresh_token": tokens.get("refresh_token", ""),
+            "id_token": id_token,
+            "account_id": account_id or "",
+        },
+    }
+
+
+def _jwt_payload(token: str) -> dict[str, Any]:
+    payload = token.split(".")[1]
+    padding = "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload + padding))
+
+
+def _chatgpt_account_id_from_id_token(id_token: str) -> str | None:
+    try:
+        data = _jwt_payload(id_token)
+    except Exception:  # noqa: BLE001
+        return None
+    auth = data.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        aid = auth.get("chatgpt_account_id")
+        return str(aid) if aid else None
+    return None
 
 
 def _pause(sec: float = ACTION_DELAY_SEC) -> None:
@@ -728,15 +892,39 @@ def _click_codex_consent_continue(page: Page, timeout: int = 8000) -> bool:
     ):
         try:
             target = loc.first
-            if target.is_visible(timeout=3000):
-                target.click(timeout=timeout)
-                _pause()
-                log("已点击「继续」")
-                return True
+            target.wait_for(state="visible", timeout=3000)
+            for _ in range(24):
+                if target.is_enabled():
+                    break
+                _pause(0.25)
+            if not target.is_enabled():
+                log("授权页「继续」按钮不可用，可能已完成授权")
+                return False
+            target.click(timeout=timeout)
+            _pause()
+            log("已点击「继续」")
+            return True
         except Exception:  # noqa: BLE001
             pass
 
     return False
+
+
+def _wait_oauth_complete_or_leave_consent(
+    page: Page,
+    oauth: "OAuthLoginSession | None",
+    *,
+    timeout_sec: float = 45,
+) -> bool:
+    """点击授权「继续」后：本地 OAuth 回调完成，或浏览器离开 consent/进入 localhost。"""
+    def ready() -> bool:
+        if oauth is not None and oauth.is_done:
+            return True
+        if _is_callback_url(page.url):
+            return True
+        return not _is_codex_consent_page(page)
+
+    return _poll_until(ready, timeout_sec=timeout_sec)
 
 
 def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
@@ -850,12 +1038,42 @@ def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
     return False
 
 
+def _control_label(el: Any) -> str:
+    """读取按钮/链接的可点击文案（inner_text + aria-label）。"""
+    parts: list[str] = []
+    try:
+        text = (el.inner_text(timeout=1500) or "").strip()
+        if text:
+            parts.append(re.sub(r"\s+", " ", text))
+    except Exception:  # noqa: BLE001
+        pass
+    for attr in ("aria-label", "title"):
+        try:
+            val = (el.get_attribute(attr) or "").strip()
+            if val:
+                parts.append(val)
+        except Exception:  # noqa: BLE001
+            pass
+    return " | ".join(dict.fromkeys(parts))
+
+
+def _is_choose_another_account_label(text: str) -> bool:
+    label = re.sub(r"\s+", " ", (text or "").strip())
+    if not label or len(label) > 120:
+        return False
+    if CHOOSE_ACCOUNT_EXCLUDE_RE.search(label):
+        return False
+    return bool(CHOOSE_ANOTHER_ACCOUNT_RE.search(label))
+
+
 def _click_locator_if_match(
     loc: Any,
     pattern: re.Pattern[str],
     *,
     timeout: int = 10000,
+    label_check: Callable[[str], bool] | None = None,
 ) -> bool:
+    checker = label_check or (lambda text: bool(text and pattern.search(text)))
     try:
         count = loc.count()
     except Exception:  # noqa: BLE001
@@ -865,8 +1083,8 @@ def _click_locator_if_match(
             el = loc.nth(i)
             if not el.is_visible():
                 continue
-            text = (el.inner_text(timeout=2000) or "").strip()
-            if text and not pattern.search(text):
+            label = _control_label(el)
+            if not checker(label):
                 continue
             el.scroll_into_view_if_needed(timeout=3000)
             try:
@@ -874,7 +1092,7 @@ def _click_locator_if_match(
             except Exception:  # noqa: BLE001
                 el.click(timeout=timeout, force=True)
             _pause(2)
-            log(f"已点击: {text[:48]}")
+            log(f"已点击: {label[:48]}")
             return True
         except Exception:  # noqa: BLE001
             continue
@@ -882,24 +1100,58 @@ def _click_locator_if_match(
 
 
 def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
-    """choose-an-account 页：多种方式点击「登录至另一个账户」。"""
+    """choose-an-account 页：仅点击「登录至另一个账户」类链接，避免误点移除账号。"""
     if not _is_choose_account_page(page):
         return False
 
     log("choose-an-account 页，点击「登录至另一个账户」")
     _pause(1)
 
-    candidates = [
-        page.get_by_role("button", name=CHOOSE_ANOTHER_ACCOUNT_RE),
-        page.get_by_role("link", name=CHOOSE_ANOTHER_ACCOUNT_RE),
-        page.get_by_text(CHOOSE_ANOTHER_ACCOUNT_RE),
-        page.locator("button, a, [role='button'], [role='link']").filter(
-            has_text=CHOOSE_ANOTHER_ACCOUNT_RE
-        ),
-        page.locator("button, a, [role='button'], [role='link']"),
-    ]
+    # 页面常见繁体「帐户」，优先精确点击
+    for exact_text in ("登录至另一个帐户", "登录至另一个账户", "Sign in to another account"):
+        try:
+            loc = page.get_by_text(exact_text, exact=True)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=timeout)
+                _pause(2)
+                log(f"已点击: {exact_text}")
+                if _poll_until(lambda: not _is_choose_account_page(page), timeout_sec=12):
+                    log("已离开 choose-an-account 页")
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+
+    candidates: list[Any] = []
+    for text in BTN_ANOTHER_ACCOUNT:
+        candidates.extend(
+            [
+                page.get_by_role("link", name=text, exact=True),
+                page.get_by_role("button", name=text, exact=True),
+                page.get_by_role("link", name=re.compile(re.escape(text), re.I)),
+                page.get_by_role("button", name=re.compile(re.escape(text), re.I)),
+            ]
+        )
+    candidates.extend(
+        [
+            page.get_by_role("link", name=CHOOSE_ANOTHER_ACCOUNT_RE),
+            page.get_by_role("button", name=CHOOSE_ANOTHER_ACCOUNT_RE),
+            page.get_by_text(CHOOSE_ANOTHER_ACCOUNT_RE),
+            page.get_by_label(CHOOSE_ANOTHER_ACCOUNT_RE),
+            page.locator("a, button, [role='button'], [role='link']").filter(
+                has_text=CHOOSE_ANOTHER_ACCOUNT_RE
+            ),
+        ]
+    )
+    for text in ("登录至另一个帐户", "登录至另一个账户", "Sign in to another account"):
+        candidates.append(page.get_by_label(text, exact=True))
+
     for loc in candidates:
-        if _click_locator_if_match(loc, CHOOSE_ANOTHER_ACCOUNT_RE, timeout=timeout):
+        if _click_locator_if_match(
+            loc,
+            CHOOSE_ANOTHER_ACCOUNT_RE,
+            timeout=timeout,
+            label_check=_is_choose_another_account_label,
+        ):
             if _poll_until(lambda: not _is_choose_account_page(page), timeout_sec=12):
                 log("已离开 choose-an-account 页")
                 return True
@@ -910,6 +1162,9 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
         for i in range(min(text_loc.count(), 6)):
             el = text_loc.nth(i)
             if not el.is_visible():
+                continue
+            label = _control_label(el)
+            if not _is_choose_another_account_label(label):
                 continue
             for xpath in (
                 "xpath=ancestor-or-self::button[1]",
@@ -932,13 +1187,13 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
 
     try:
         hints: list[str] = []
-        for sel in ("button", "a", "[role=button]", "[role=link]"):
+        for sel in ("a", "button", "[role=button]", "[role=link]"):
             loc = page.locator(sel)
             for i in range(min(loc.count(), 15)):
                 try:
-                    t = (loc.nth(i).inner_text(timeout=500) or "").strip()
-                    if t and len(t) < 80:
-                        hints.append(t)
+                    label = _control_label(loc.nth(i))
+                    if label and len(label) < 80:
+                        hints.append(label)
                 except Exception:  # noqa: BLE001
                     pass
         if hints:
@@ -1356,6 +1611,7 @@ def _advance_login_flow(
     password: str,
     mailapi_url: str,
     *,
+    oauth: OAuthLoginSession | None = None,
     timeout_sec: int = 180,
 ) -> None:
     """
@@ -1376,6 +1632,9 @@ def _advance_login_flow(
 
     while time.time() < deadline:
         _check_shutdown()
+        if oauth is not None and oauth.is_done:
+            log("本地 OAuth 已完成，结束浏览器登录流程")
+            return
         try:
             page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:  # noqa: BLE001
@@ -1448,9 +1707,25 @@ def _advance_login_flow(
 
         if kind == "consent":
             otp_submitted = False
+            if oauth is not None and oauth.is_done:
+                log("本地 OAuth 已完成，跳过授权页")
+                return
             if _click_codex_consent_continue(page):
-                _pause(3)
+                if _wait_oauth_complete_or_leave_consent(page, oauth, timeout_sec=45):
+                    if oauth is not None and oauth.is_done:
+                        log("本地 OAuth 回调已完成，结束浏览器登录流程")
+                        return
+                    if _is_callback_url(page.url):
+                        log("浏览器已进入 OAuth 回调")
+                        return
+                    log("已离开 Codex 授权页")
+                    continue
+                log("授权后等待 OAuth 完成超时，重试…")
+                _pause(2)
             else:
+                if oauth is not None and oauth.is_done:
+                    log("本地 OAuth 已完成，结束浏览器登录流程")
+                    return
                 log("codex/consent 授权页未点到「继续」，重试…")
                 _pause(2)
             continue
@@ -1476,10 +1751,13 @@ def _advance_login_flow(
         _wait_known_auth_page(page, timeout_sec=10)
         _pause(1)
 
+    if oauth is not None and oauth.is_done:
+        log("本地 OAuth 已完成")
+        return
     if _poll_until(lambda: _is_callback_url(page.url), timeout_sec=60):
         log("OAuth 回调已完成")
     else:
-        log("等待 OAuth 回调超时，继续检查 auth.json")
+        log("等待浏览器 OAuth 回调超时（若本地 OAuth 已成功可忽略）")
 
 
 def _system_chrome_user_data() -> Path:
@@ -1532,6 +1810,7 @@ def browser_oauth_login(
     password: str,
     mailapi_url: str,
     *,
+    oauth: OAuthLoginSession | None = None,
     headless: bool = False,
     chrome_profile: Path = DEFAULT_CHROME_PROFILE,
     use_system_chrome: bool = True,
@@ -1562,7 +1841,7 @@ def browser_oauth_login(
                 if not _try_another_account(page, timeout=10000):
                     log("未找到「另一个账户」按钮，可能已在登录页")
 
-                _advance_login_flow(page, email, password, mailapi_url)
+                _advance_login_flow(page, email, password, mailapi_url, oauth=oauth)
                 _pause()
             except KeyboardInterrupt:
                 raise
@@ -1727,9 +2006,7 @@ def _now_cn_iso() -> str:
 
 def _jwt_exp_cn_iso(token: str) -> str | None:
     try:
-        payload = token.split(".")[1]
-        padding = "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload + padding))
+        data = _jwt_payload(token)
         exp = data.get("exp")
         if exp:
             return datetime.fromtimestamp(int(exp), TZ_CN).strftime("%Y-%m-%dT%H:%M:%S%z").replace(
@@ -1878,10 +2155,6 @@ def save_account_single(account: dict[str, Any], accounts_dir: Path = DEFAULT_AC
     return path
 
 
-def run_codex_logout() -> None:
-    subprocess.run(["codex", "logout"], check=False, capture_output=True, text=True)
-
-
 class CodexEnvBackup:
     """备份并还原 ~/.codex/auth.json 与 config.toml（退出/中断时也会还原）。"""
 
@@ -1969,6 +2242,7 @@ def refresh_one_via_browser(
     use_system_chrome: bool,
     cdp_url: str | None,
 ) -> dict[str, Any]:
+    del auth_path  # 浏览器 OAuth 不再依赖 ~/.codex/auth.json
     email = account["email"]
     password = account.get("password") or ""
     mailapi_url = get_mailapi_url(account)
@@ -1978,14 +2252,10 @@ def refresh_one_via_browser(
         raise ValueError(f"{email}: 缺少 password")
 
     log(f"{email}: 使用浏览器模拟登录刷新…")
-    run_codex_logout()
-    if auth_path.exists():
-        auth_path.unlink()
-
-    login = CodexLoginProcess()
+    oauth = OAuthLoginSession()
     global _active_login
-    _active_login = login
-    oauth_url = login.start()
+    _active_login = oauth
+    oauth_url = oauth.start()
 
     try:
         browser_oauth_login(
@@ -1993,22 +2263,20 @@ def refresh_one_via_browser(
             email,
             password,
             mailapi_url,
+            oauth=oauth,
             headless=headless,
             chrome_profile=chrome_profile,
             use_system_chrome=use_system_chrome,
             cdp_url=cdp_url,
         )
-        auth = wait_for_auth(auth_path, login)
+        tokens = oauth.wait_for_tokens(timeout=300)
     except KeyboardInterrupt:
         _handle_interrupt()
     finally:
         _active_login = None
-        if _shutdown_requested.is_set():
-            login.terminate()
-        else:
-            login.wait_done(timeout=60)
+        oauth.shutdown()
 
-    return merge_auth_into_account(account, auth)
+    return merge_auth_into_account(account, _oauth_tokens_to_auth(tokens))
 
 
 def refresh_one(
