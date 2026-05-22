@@ -128,6 +128,11 @@ KNOWN_AUTH_PAGE_URL_RE = re.compile(
     r"localhost:\d+",
     re.I,
 )
+POST_LOGIN_NAV_URL_RE = re.compile(
+    r"auth\.openai\.com/(?:mfa-challenge|email-verification|sign-in-with-chatgpt/codex/consent)|"
+    r"localhost:\d+",
+    re.I,
+)
 BTN_ANOTHER_ACCOUNT = [
     "登录至另一个帐户", "登录至另一个账户",
     "Sign in to another account",
@@ -561,9 +566,8 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
                 session.fail(exc)
                 self._respond(500, str(exc).encode("utf-8", errors="replace")[:500])
                 return
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{session.port}/success")
-            self.end_headers()
+            # 直接返回成功页，避免 302 后浏览器已关闭导致 BrokenPipeError
+            self._respond(200, OAUTH_SUCCESS_HTML, content_type="text/html; charset=utf-8")
             return
 
         if path == "/success":
@@ -584,11 +588,15 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
         *,
         content_type: str = "text/plain; charset=utf-8",
     ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # 浏览器/Playwright 关闭连接后写响应会触发，OAuth 已成功时可忽略
+            pass
 
 
 class OAuthLoginSession:
@@ -1388,11 +1396,28 @@ def _wait_leave_login_or_create(page: Page, timeout_sec: int = 25) -> None:
         log("已离开 log-in-or-create-account 页")
 
 
-def _wait_after_password(page: Page, timeout_sec: int = 25) -> None:
-    if not _is_login_password_page(page):
-        return
-    if _poll_until(lambda: not _is_login_password_page(page), timeout_sec=timeout_sec):
-        log("已离开 log-in/password 密码页")
+def _password_submit_ready(page: Page) -> bool:
+    if _is_mfa_challenge_page(page) or _is_email_verification_page(page):
+        return True
+    if _is_codex_consent_page(page) or _is_callback_url(page.url):
+        return True
+    return not _is_login_password_page(page)
+
+
+def _wait_after_password(page: Page, timeout_sec: int = 35) -> bool:
+    """密码提交后等待跳转（优先 wait_for_url，避免轮询 + load_state 叠加卡顿）。"""
+    timeout_ms = max(1000, int(timeout_sec * 1000))
+    try:
+        page.wait_for_url(POST_LOGIN_NAV_URL_RE, timeout=timeout_ms)
+        log("密码提交后已进入下一页")
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    if _poll_until(_password_submit_ready, timeout_sec=min(8.0, timeout_sec), interval=0.3):
+        log("密码提交后已进入下一页")
+        return True
+    return _password_submit_ready(page)
 
 
 def _fill_password(page: Page, password: str) -> bool:
@@ -1409,13 +1434,23 @@ def _fill_password(page: Page, password: str) -> bool:
     _pause()
     _type_chars(pwd, password)
     _pause()
-    if not _click_text(page, BTN_SUBMIT, timeout=5000):
-        page.keyboard.press("Enter")
-        _pause()
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:  # noqa: BLE001
-        _pause(2)
+    submitted = False
+    for loc in (
+        page.get_by_role("button", name=re.compile(r"^(继续|Continue|Log in|登录|Submit|提交)$", re.I)),
+        page.locator('button[type="submit"]'),
+    ):
+        try:
+            btn = loc.first
+            if btn.is_visible(timeout=1500) and btn.is_enabled():
+                btn.click(timeout=5000)
+                submitted = True
+                break
+        except Exception:  # noqa: BLE001
+            pass
+    if not submitted:
+        if not _click_text(page, ["继续", "Continue", "Log in", "登录"], timeout=3000):
+            page.keyboard.press("Enter")
+    _pause(0.3)
     return True
 
 
@@ -1627,6 +1662,7 @@ def _advance_login_flow(
     deadline = time.time() + timeout_sec
     otp_submitted = False
     login_email_done = False
+    password_done = False
     choose_account_tries = 0
     last_kind = ""
 
@@ -1635,10 +1671,12 @@ def _advance_login_flow(
         if oauth is not None and oauth.is_done:
             log("本地 OAuth 已完成，结束浏览器登录流程")
             return
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=5000)
-        except Exception:  # noqa: BLE001
-            pass
+        # 密码/MFA 跳转期间避免每轮 wait_for_load_state(5s) 反复超时
+        if not (password_done and _is_login_password_page(page)):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=800)
+            except Exception:  # noqa: BLE001
+                pass
 
         kind = _login_page_kind(page)
         if kind != last_kind:
@@ -1691,10 +1729,13 @@ def _advance_login_flow(
         if kind == "password":
             otp_submitted = False
             login_email_done = True
+            if password_done:
+                if _is_login_password_page(page):
+                    _wait_after_password(page, timeout_sec=35)
+                continue
             if _fill_password(page, password):
-                _wait_after_password(page)
-                _wait_known_auth_page(page)
-            _pause(2)
+                password_done = True
+                _wait_after_password(page, timeout_sec=35)
             continue
 
         if kind in ("email_verification", "mfa_email_otp"):
@@ -1804,6 +1845,23 @@ def _launch_browser_context(
     return None, context, True
 
 
+def _open_oauth_url(page: Page, oauth_url: str) -> None:
+    """打开 OAuth 授权页；commit 优先，超时后若已在 auth.openai.com 则继续。"""
+    last_err: Exception | None = None
+    for wait_until, timeout_ms in (("commit", 45000), ("domcontentloaded", 60000)):
+        try:
+            page.goto(oauth_url, wait_until=wait_until, timeout=timeout_ms)
+            return
+        except PlaywrightError as exc:
+            last_err = exc
+            cur = page.url or ""
+            if "auth.openai.com" in cur:
+                log(f"OAuth 导航 {wait_until} 超时，但页面已打开: {cur.split('?', 1)[0]}")
+                return
+    if last_err is not None:
+        raise last_err
+
+
 def browser_oauth_login(
     oauth_url: str,
     email: str,
@@ -1832,7 +1890,7 @@ def browser_oauth_login(
 
             try:
                 log(f"打开 OAuth: {oauth_url[:80]}…")
-                page.goto(oauth_url, wait_until="domcontentloaded", timeout=15000)
+                _open_oauth_url(page, oauth_url)
                 _pause()
 
                 if _is_mfa_challenge_page(page):
