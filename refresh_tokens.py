@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""全自动刷新 Codex token：codex login 后台 + 浏览器登录 + 正则解析验证码 + 回写 accounts.json"""
+"""全自动刷新 Codex token：优先 refresh_token API，失败则 codex login + 浏览器登录 + 回写 accounts.json"""
 
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
 
 try:
+    from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import Page, sync_playwright
 except ImportError:
     print("请先: pip install -r requirements.txt && playwright install chromium", file=sys.stderr)
@@ -53,9 +54,17 @@ OTP_CONTEXT_PATTERNS = [
     re.compile(r"enter this code[:\s]+(\d{6})", re.I),
 ]
 REFRESHED_MARK = "已刷新"
+ABANDONED_MARK = "已废弃"
+ABNORMAL_MARK = "异常"
 ACTION_DELAY_SEC = 1  # 浏览器操作之间的间隔（秒）
 ACCOUNT_GAP_SEC = 30  # 每个账号刷新之间的间隔（秒）
 TYPE_CHAR_DELAY_MS = 300  # 逐字符输入间隔（毫秒）
+
+# Codex OAuth refresh（与 codex-rs/login 一致）
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OAUTH_TOKEN_URL = os.environ.get(
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE", "https://auth.openai.com/oauth/token"
+)
 
 # 多语言按钮文案
 BTN_CONTINUE = [
@@ -78,6 +87,19 @@ LOGIN_PASSWORD_URL_RE = re.compile(
     r"auth\.openai\.com/log-in/password",
     re.I,
 )
+MFA_CHALLENGE_URL_RE = re.compile(
+    r"auth\.openai\.com/mfa-challenge",
+    re.I,
+)
+OTP_ERROR_RE = re.compile(
+    r"incorrect.{0,24}code|wrong.{0,24}code|invalid.{0,24}code|"
+    r"code.{0,24}(incorrect|invalid|wrong|expired)|"
+    r"verification code.{0,40}(incorrect|invalid|wrong|expired)|"
+    r"验证码.{0,12}(错误|不正确|无效|失效|过期)|"
+    r"(错误|不正确|无效|过期)的验证码|"
+    r"enter a valid code|try again",
+    re.I,
+)
 KNOWN_AUTH_PAGE_URL_RE = re.compile(
     r"auth\.openai\.com/(?:log-in(?:/password)?|email-verification)|"
     r"auth\.openai\.com/sign-in-with-chatgpt/codex/consent|"
@@ -90,9 +112,68 @@ BTN_ANOTHER_ACCOUNT = [
 ]
 BTN_SUBMIT = ["Continue", "继续", "Log in", "登录", "Verify", "验证", "Submit", "提交", "Next", "下一步"]
 
+_shutdown_requested = threading.Event()
+_active_login: Any = None
+_sigint_count = 0
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _check_shutdown() -> None:
+    if _shutdown_requested.is_set():
+        raise KeyboardInterrupt("用户中断")
+
+
+def _interruptible_sleep(sec: float) -> None:
+    deadline = time.time() + sec
+    while time.time() < deadline:
+        _check_shutdown()
+        time.sleep(min(0.25, deadline - time.time()))
+
+
+def _handle_interrupt(signum: int | None = None) -> None:
+    """还原 ~/.codex、终止 codex login，立即退出（不等待 Playwright 清理）。"""
+    if not _shutdown_requested.is_set():
+        sig_label = signum if signum is not None else signal.SIGINT
+        log(f"收到信号 {sig_label}，正在还原 ~/.codex …")
+        backup = _active_codex_backup
+        if backup is not None:
+            backup.restore()
+        _shutdown_requested.set()
+        login = _active_login
+        if login is not None:
+            login.terminate()
+    code = 128 + signum if signum is not None else 130
+    log("已中断，退出")
+    os._exit(code)
+
+
+def _poll_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout_sec: float = 20,
+    interval: float = 0.4,
+) -> bool:
+    """短间隔轮询，避免 Playwright 长 wait 阻塞 Ctrl+C。"""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        _check_shutdown()
+        try:
+            if predicate():
+                return True
+        except PlaywrightError:
+            if _shutdown_requested.is_set():
+                _check_shutdown()
+            raise
+        _interruptible_sleep(interval)
+    try:
+        return predicate()
+    except PlaywrightError:
+        if _shutdown_requested.is_set():
+            _check_shutdown()
+        return False
 
 
 def load_accounts(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -119,8 +200,46 @@ def _is_marked_refreshed(line: str) -> bool:
     return REFRESHED_MARK in line
 
 
+def _is_marked_abandoned(line: str) -> bool:
+    return ABANDONED_MARK in line
+
+
+def _is_marked_abnormal(line: str) -> bool:
+    return ABNORMAL_MARK in line
+
+
 def _refresh_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_skipped_abnormal(path: Path, email: str) -> bool:
+    """need_email.txt 中已标记「异常」则跳过。"""
+    if not path.exists():
+        return False
+    key = email.strip().lower()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not _is_marked_abnormal(line):
+                continue
+            addr = _parse_need_email_line(line)
+            if addr and addr.lower() == key:
+                return True
+    return False
+
+
+def is_skipped_abandoned(path: Path, email: str) -> bool:
+    """need_email.txt 中已标记「已废弃」则跳过。"""
+    if not path.exists():
+        return False
+    key = email.strip().lower()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not _is_marked_abandoned(line):
+                continue
+            addr = _parse_need_email_line(line)
+            if addr and addr.lower() == key:
+                return True
+    return False
 
 
 def is_skipped_refreshed(path: Path, email: str) -> bool:
@@ -142,12 +261,58 @@ def load_need_emails(path: Path) -> list[str]:
     emails: list[str] = []
     with path.open(encoding="utf-8") as f:
         for line in f:
-            if _is_marked_refreshed(line):
+            if _is_marked_refreshed(line) or _is_marked_abandoned(line) or _is_marked_abnormal(line):
                 continue
             email = _parse_need_email_line(line)
             if email:
                 emails.append(email)
     return emails
+
+
+def mark_abnormal_in_need_emails(path: Path, email: str, *, reason: str = "验证码错误") -> bool:
+    """在 need_email.txt 标记「异常」，后续自动跳过。"""
+    if not path.exists():
+        return False
+    key = email.strip().lower()
+    ts = _refresh_timestamp()
+    lines: list[str] = []
+    marked = False
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            addr = _parse_need_email_line(line)
+            if addr and addr.lower() == key:
+                lines.append(f"{addr}  # {ABNORMAL_MARK} {reason} {ts}\n")
+                marked = True
+            else:
+                lines.append(line if line.endswith("\n") else line + "\n")
+    if marked:
+        with path.open("w", encoding="utf-8") as f:
+            f.writelines(lines)
+        log(f"已在 {path.name} 标记: {email}  # {ABNORMAL_MARK} {reason} {ts}")
+    return marked
+
+
+def mark_abandoned_in_need_emails(path: Path, email: str, *, reason: str = "MFA") -> bool:
+    """在 need_email.txt 标记「已废弃」，后续自动跳过。"""
+    if not path.exists():
+        return False
+    key = email.strip().lower()
+    ts = _refresh_timestamp()
+    lines: list[str] = []
+    marked = False
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            addr = _parse_need_email_line(line)
+            if addr and addr.lower() == key:
+                lines.append(f"{addr}  # {ABANDONED_MARK} {reason} {ts}\n")
+                marked = True
+            else:
+                lines.append(line if line.endswith("\n") else line + "\n")
+    if marked:
+        with path.open("w", encoding="utf-8") as f:
+            f.writelines(lines)
+        log(f"已在 {path.name} 标记: {email}  # {ABANDONED_MARK} {reason} {ts}")
+    return marked
 
 
 def mark_refreshed_in_need_emails(path: Path, email: str) -> bool:
@@ -221,19 +386,22 @@ def fetch_email_code(mailapi_url: str, timeout: int = 180, interval: int = 5) ->
     deadline = time.time() + timeout
     last_error = ""
     while time.time() < deadline:
+        _check_shutdown()
         try:
-            resp = requests.get(mailapi_url, timeout=30)
+            resp = requests.get(mailapi_url, timeout=10)
             resp.raise_for_status()
             data = resp.json()
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
-            time.sleep(interval)
+            _interruptible_sleep(interval)
             continue
 
         status = str(data.get("status", "")).lower()
         if status and status not in ("success", "ok", ""):
             last_error = f"status={status}"
-            time.sleep(interval)
+            _interruptible_sleep(interval)
             continue
 
         code = extract_code_from_mailapi(data)
@@ -241,7 +409,7 @@ def fetch_email_code(mailapi_url: str, timeout: int = 180, interval: int = 5) ->
             log(f"验证码: {code} (from={data.get('from', '?')})")
             return code
 
-        time.sleep(interval)
+        _interruptible_sleep(interval)
 
     raise TimeoutError(f"等待邮箱验证码超时 ({timeout}s): {last_error}")
 
@@ -281,19 +449,39 @@ class CodexLoginProcess:
 
         deadline = time.time() + 90
         while time.time() < deadline:
+            _check_shutdown()
             if self.oauth_url:
                 return self.oauth_url
             if self.proc.poll() is not None:
                 break
-            time.sleep(0.3)
+            _interruptible_sleep(0.3)
 
         with self._lock:
             buf = "".join(self._output)
         raise RuntimeError(f"未能从 codex login 输出解析 OAuth URL:\n{buf}")
 
+    def terminate(self) -> None:
+        if not self.proc or self.proc.poll() is not None:
+            return
+        log("终止 codex login 进程…")
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            log(f"终止 codex login 失败: {exc}")
+
     def wait_done(self, timeout: int = 300) -> None:
         """等待 codex login 自然结束（回调完成），不主动 kill。"""
         if not self.proc:
+            return
+        if _shutdown_requested.is_set():
+            self.terminate()
             return
         try:
             self.proc.wait(timeout=timeout)
@@ -309,6 +497,7 @@ class CodexLoginProcess:
 def wait_for_auth(auth_path: Path, login: CodexLoginProcess, timeout: int = 300) -> dict[str, Any]:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        _check_shutdown()
         if auth_path.exists():
             try:
                 data = json.loads(auth_path.read_text(encoding="utf-8"))
@@ -320,13 +509,13 @@ def wait_for_auth(auth_path: Path, login: CodexLoginProcess, timeout: int = 300)
                     return data
             except json.JSONDecodeError:
                 pass
-        time.sleep(2)
+        _interruptible_sleep(2)
 
     raise TimeoutError(f"等待 {auth_path} 写入超时")
 
 
 def _pause(sec: float = ACTION_DELAY_SEC) -> None:
-    time.sleep(sec)
+    _interruptible_sleep(sec)
 
 
 def _auth_path(url: str) -> str:
@@ -353,10 +542,67 @@ def _is_login_password_page(page: Page) -> bool:
     return bool(LOGIN_PASSWORD_URL_RE.search(page.url)) or _auth_path(page.url) == "/log-in/password"
 
 
+def _is_mfa_challenge_page(page: Page) -> bool:
+    """https://auth.openai.com/mfa-challenge — 需人工 MFA，账号无法自动刷新。"""
+    return bool(MFA_CHALLENGE_URL_RE.search(page.url)) or _auth_path(page.url) == "/mfa-challenge"
+
+
+class MfaChallengeError(Exception):
+    """遇到 MFA 二次验证页，账号视为废弃。"""
+
+
+class AccountAbnormalError(Exception):
+    """账号异常（如邮箱验证码错误），无法继续自动刷新。"""
+
+
+def _detect_otp_error(page: Page) -> str | None:
+    """检测 email-verification 页上的验证码错误提示。"""
+    if not _is_email_verification_page(page):
+        return None
+
+    snippets: list[str] = []
+    for sel in ('[role="alert"]', '[data-testid*="error"]', '[class*="error"]'):
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 8)):
+                text = (loc.nth(i).inner_text(timeout=800) or "").strip()
+                if text:
+                    snippets.append(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000) or ""
+        if body_text:
+            snippets.append(body_text)
+    except Exception:  # noqa: BLE001
+        pass
+
+    for text in snippets:
+        for line in text.splitlines():
+            line = line.strip()
+            if line and OTP_ERROR_RE.search(line):
+                return line[:160]
+        if OTP_ERROR_RE.search(text):
+            m = OTP_ERROR_RE.search(text)
+            if m:
+                start = max(0, m.start() - 20)
+                return text[start : m.end() + 40].strip()[:160]
+    return None
+
+
+def _check_otp_error_or_raise(page: Page) -> None:
+    err = _detect_otp_error(page)
+    if err:
+        raise AccountAbnormalError(f"邮箱验证码错误: {err}")
+
+
 def _login_page_kind(page: Page) -> str:
     """按 URL 判定当前登录阶段（不依赖 DOM 猜测）。"""
     if _is_callback_url(page.url):
         return "callback"
+    if _is_mfa_challenge_page(page):
+        return "mfa_challenge"
     if _is_codex_consent_page(page):
         return "consent"
     if _is_email_verification_page(page):
@@ -375,28 +621,24 @@ def _log_current_page(page: Page, kind: str | None = None) -> None:
 
 
 def _wait_known_auth_page(page: Page, timeout_sec: int = 20) -> None:
-    try:
-        page.wait_for_url(KNOWN_AUTH_PAGE_URL_RE, timeout=timeout_sec * 1000)
-    except Exception:  # noqa: BLE001
-        pass
+    _poll_until(
+        lambda: bool(KNOWN_AUTH_PAGE_URL_RE.search(page.url)),
+        timeout_sec=timeout_sec,
+    )
 
 
 def _wait_email_verification_page(page: Page, timeout_sec: int = 30) -> bool:
-    try:
-        page.wait_for_url(EMAIL_VERIFICATION_URL_RE, timeout=timeout_sec * 1000)
+    if _poll_until(lambda: _is_email_verification_page(page), timeout_sec=timeout_sec):
         log("已进入邮箱验证码页 email-verification")
         return True
-    except Exception:  # noqa: BLE001
-        return _is_email_verification_page(page)
+    return _is_email_verification_page(page)
 
 
 def _wait_codex_consent_page(page: Page, timeout_sec: int = 30) -> bool:
-    try:
-        page.wait_for_url(CODEX_CONSENT_URL_RE, timeout=timeout_sec * 1000)
+    if _poll_until(lambda: _is_codex_consent_page(page), timeout_sec=timeout_sec):
         log("已进入 Codex 授权页")
         return True
-    except Exception:  # noqa: BLE001
-        return _is_codex_consent_page(page)
+    return _is_codex_consent_page(page)
 
 
 def _click_codex_consent_continue(page: Page, timeout: int = 8000) -> bool:
@@ -481,15 +723,10 @@ def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
 def _wait_leave_email_verification(page: Page, timeout_sec: int = 20) -> bool:
     if not _is_email_verification_page(page):
         return True
-    try:
-        page.wait_for_function(
-            "() => !window.location.href.includes('email-verification')",
-            timeout=timeout_sec * 1000,
-        )
+    if _poll_until(lambda: not _is_email_verification_page(page), timeout_sec=timeout_sec):
         log("已离开邮箱验证码页")
         return True
-    except Exception:  # noqa: BLE001
-        return not _is_email_verification_page(page)
+    return not _is_email_verification_page(page)
 
 
 def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
@@ -657,27 +894,15 @@ def _handle_login_email(page: Page, email: str) -> bool:
 def _wait_leave_login_email(page: Page, timeout_sec: int = 25) -> None:
     if not _is_login_email_page(page):
         return
-    try:
-        page.wait_for_function(
-            "() => new URL(location.href).pathname.replace(/\\/$/, '') !== '/log-in'",
-            timeout=timeout_sec * 1000,
-        )
+    if _poll_until(lambda: not _is_login_email_page(page), timeout_sec=timeout_sec):
         log("已离开 log-in 邮箱页")
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _wait_after_password(page: Page, timeout_sec: int = 25) -> None:
     if not _is_login_password_page(page):
         return
-    try:
-        page.wait_for_function(
-            "() => !new URL(location.href).pathname.replace(/\\/$/, '').endsWith('/log-in/password')",
-            timeout=timeout_sec * 1000,
-        )
+    if _poll_until(lambda: not _is_login_password_page(page), timeout_sec=timeout_sec):
         log("已离开 log-in/password 密码页")
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _fill_password(page: Page, password: str) -> bool:
@@ -772,7 +997,10 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
         log("未点到「继续」，尝试 Enter")
         page.keyboard.press("Enter")
         _pause()
+    _pause(1.5)
+    _check_otp_error_or_raise(page)
     if not _wait_leave_email_verification(page, timeout_sec=20):
+        _check_otp_error_or_raise(page)
         log("提交后仍在验证码页")
     return True
 
@@ -798,6 +1026,7 @@ def _advance_login_flow(
     last_kind = ""
 
     while time.time() < deadline:
+        _check_shutdown()
         try:
             page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:  # noqa: BLE001
@@ -811,6 +1040,9 @@ def _advance_login_flow(
         if kind == "callback":
             log("已进入 OAuth 回调")
             return
+
+        if kind == "mfa_challenge":
+            raise MfaChallengeError(f"遇到 MFA 验证页: {page.url.split('?', 1)[0]}")
 
         if kind == "login":
             otp_submitted = False
@@ -832,9 +1064,13 @@ def _advance_login_flow(
             if otp_submitted:
                 log("验证码已填，重试点击「继续」…")
                 _click_otp_submit(page)
+                _pause(1.5)
+                _check_otp_error_or_raise(page)
                 _wait_leave_email_verification(page, timeout_sec=15)
                 if not _is_email_verification_page(page):
                     otp_submitted = False
+                else:
+                    _check_otp_error_or_raise(page)
             elif _fill_otp(page, mailapi_url):
                 otp_submitted = True
                 if not _is_email_verification_page(page):
@@ -860,10 +1096,9 @@ def _advance_login_flow(
         _wait_known_auth_page(page, timeout_sec=10)
         _pause(1)
 
-    try:
-        page.wait_for_url(re.compile(r"localhost:\d+"), timeout=60000)
+    if _poll_until(lambda: _is_callback_url(page.url), timeout_sec=60):
         log("OAuth 回调已完成")
-    except Exception:  # noqa: BLE001
+    else:
         log("等待 OAuth 回调超时，继续检查 auth.json")
 
 
@@ -922,31 +1157,165 @@ def browser_oauth_login(
     use_system_chrome: bool = True,
     cdp_url: str | None = None,
 ) -> None:
-    with sync_playwright() as p:
-        browser, context, owns = _launch_browser_context(
-            p,
-            chrome_profile=chrome_profile,
-            use_system_chrome=use_system_chrome,
-            headless=headless,
-            cdp_url=cdp_url,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(45000)
+    if _shutdown_requested.is_set():
+        _check_shutdown()
+    try:
+        with sync_playwright() as p:
+            browser, context, owns = _launch_browser_context(
+                p,
+                chrome_profile=chrome_profile,
+                use_system_chrome=use_system_chrome,
+                headless=headless,
+                cdp_url=cdp_url,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(10000)
 
-        log(f"打开 OAuth: {oauth_url[:80]}…")
-        page.goto(oauth_url, wait_until="domcontentloaded")
-        _pause()
+            try:
+                log(f"打开 OAuth: {oauth_url[:80]}…")
+                page.goto(oauth_url, wait_until="domcontentloaded", timeout=15000)
+                _pause()
 
-        if not _try_another_account(page, timeout=10000):
-            log("未找到「另一个账户」按钮，可能已在登录页")
+                if _is_mfa_challenge_page(page):
+                    raise MfaChallengeError(f"遇到 MFA 验证页: {page.url.split('?', 1)[0]}")
 
-        _advance_login_flow(page, email, password, mailapi_url)
+                if not _try_another_account(page, timeout=10000):
+                    log("未找到「另一个账户」按钮，可能已在登录页")
 
-        _pause()
-        if owns:
-            context.close()
-        elif browser:
-            pass  # CDP 模式不关闭用户自己的 Chrome
+                _advance_login_flow(page, email, password, mailapi_url)
+                _pause()
+            except KeyboardInterrupt:
+                raise
+            except PlaywrightError:
+                if _shutdown_requested.is_set():
+                    raise KeyboardInterrupt from None
+                raise
+            finally:
+                if owns and not _shutdown_requested.is_set():
+                    try:
+                        context.close()
+                    except PlaywrightError:
+                        pass
+    except KeyboardInterrupt:
+        raise
+
+
+class RefreshTokenError(Exception):
+    """refresh_token 刷新失败；permanent=True 表示需重新登录。"""
+
+    def __init__(self, message: str, *, permanent: bool = False, code: str | None = None) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+        self.code = code
+
+
+def _extract_refresh_error_code(body: str) -> str | None:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if isinstance(err, dict):
+        code = err.get("code")
+        return str(code) if code else None
+    if isinstance(err, str):
+        return err
+    code = data.get("code")
+    return str(code) if code else None
+
+
+def load_refresh_token_for_account(
+    account: dict[str, Any],
+    proxy_dir: Path = CLI_PROXY_DIR,
+) -> str | None:
+    """优先 ~/.cli-proxy-api/<邮箱>.json，其次 accounts 中的 refresh_token。"""
+    email = str(account.get("email", "")).strip()
+    if email:
+        proxy_path = proxy_dir / f"{email}.json"
+        if proxy_path.exists():
+            try:
+                data = _load_json_file(proxy_path)
+                rt = str(data.get("refresh_token", "")).strip()
+                if rt:
+                    return rt
+            except json.JSONDecodeError as exc:
+                log(f"读取 {proxy_path.name} 失败: {exc}")
+
+    rt = str(account.get("refresh_token", "")).strip()
+    return rt or None
+
+
+def request_token_refresh(refresh_token: str, *, timeout: int = 30) -> dict[str, Any]:
+    """POST https://auth.openai.com/oauth/token 用 refresh_token 换取新 token。"""
+    resp = requests.post(
+        OAUTH_TOKEN_URL,
+        json={
+            "client_id": OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        if not data.get("access_token"):
+            raise RefreshTokenError("响应缺少 access_token", permanent=True)
+        return data
+
+    body = resp.text or ""
+    code = _extract_refresh_error_code(body)
+    permanent = resp.status_code == 401
+    detail = body[:240] if body else resp.reason
+    raise RefreshTokenError(
+        f"HTTP {resp.status_code}: {detail}",
+        permanent=permanent,
+        code=code,
+    )
+
+
+def merge_refresh_response_into_account(
+    account: dict[str, Any],
+    tokens: dict[str, Any],
+) -> dict[str, Any]:
+    if tokens.get("access_token"):
+        account["access_token"] = tokens["access_token"]
+    if tokens.get("refresh_token"):
+        account["refresh_token"] = tokens["refresh_token"]
+    if tokens.get("id_token"):
+        account["id_token"] = tokens["id_token"]
+    account["last_token_refresh"] = datetime.now(timezone.utc).isoformat()
+    account["auth_mode"] = account.get("auth_mode") or "chatgpt"
+    return account
+
+
+def try_refresh_via_refresh_token(
+    account: dict[str, Any],
+    *,
+    proxy_dir: Path = CLI_PROXY_DIR,
+) -> dict[str, Any] | None:
+    """用 refresh_token 刷新；无 token 或失败返回 None。"""
+    email = str(account.get("email", ""))
+    refresh_token = load_refresh_token_for_account(account, proxy_dir=proxy_dir)
+    if not refresh_token:
+        log(f"{email}: 无 refresh_token，跳过 API 刷新")
+        return None
+
+    log(f"{email}: 尝试 refresh_token API 刷新…")
+    try:
+        tokens = request_token_refresh(refresh_token)
+    except RefreshTokenError as exc:
+        hint = f" ({exc.code})" if exc.code else ""
+        log(f"{email}: refresh_token 刷新失败{hint}: {exc}")
+        return None
+    except requests.RequestException as exc:
+        log(f"{email}: refresh_token 请求异常: {exc}")
+        return None
+
+    log(f"{email}: refresh_token API 刷新成功")
+    return merge_refresh_response_into_account(account, tokens)
 
 
 def merge_auth_into_account(account: dict[str, Any], auth: dict[str, Any]) -> dict[str, Any]:
@@ -1048,6 +1417,72 @@ def sync_cli_proxy_token(
     return path
 
 
+def persist_refresh_success(
+    updated: dict[str, Any],
+    *,
+    email: str,
+    accounts_path: Path,
+    rows: list[dict[str, Any]],
+    need_email_path: Path,
+    accounts_dir: Path = DEFAULT_ACCOUNTS_DIR,
+    cli_proxy_dir: Path = CLI_PROXY_DIR,
+    sync_cli_proxy: bool = True,
+) -> None:
+    """refresh_token / 浏览器登录成功后统一写回：accounts、单账号文件、cli-proxy、need_email。"""
+    save_accounts(accounts_path, rows)
+    single_path = save_account_single(updated, accounts_dir=accounts_dir)
+    log(f"已更新单账号文件 -> {single_path.name}")
+    if sync_cli_proxy:
+        sync_cli_proxy_token(updated, proxy_dir=cli_proxy_dir)
+    mark_refreshed_in_need_emails(need_email_path, email)
+
+
+def mark_cli_proxy_disabled(
+    email: str,
+    proxy_dir: Path = CLI_PROXY_DIR,
+) -> None:
+    """cli-proxy 原件标记 disabled=true。"""
+    path = proxy_dir / f"{email.strip()}.json"
+    if not path.exists():
+        log(f"cli-proxy 原件不存在，跳过 disabled: {path.name}")
+        return
+    try:
+        data = _load_json_file(path)
+    except json.JSONDecodeError as exc:
+        log(f"cli-proxy 原件解析失败，跳过 disabled: {path.name} ({exc})")
+        return
+    data["disabled"] = True
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    tmp.replace(path)
+    log(f"已标记 cli-proxy disabled=true -> {path.name}")
+
+
+def persist_account_abandoned(
+    email: str,
+    *,
+    need_email_path: Path,
+    cli_proxy_dir: Path = CLI_PROXY_DIR,
+    reason: str = "MFA",
+    sync_cli_proxy: bool = True,
+) -> None:
+    """MFA 等不可恢复情况：标记 need_email 已废弃 + cli-proxy disabled。"""
+    mark_abandoned_in_need_emails(need_email_path, email, reason=reason)
+    if sync_cli_proxy:
+        mark_cli_proxy_disabled(email, proxy_dir=cli_proxy_dir)
+
+
+def persist_account_abnormal(
+    email: str,
+    *,
+    need_email_path: Path,
+    reason: str = "验证码错误",
+) -> None:
+    """验证码错误等异常：仅标记 need_email 异常。"""
+    mark_abnormal_in_need_emails(need_email_path, email, reason=reason)
+
+
 def save_account_single(account: dict[str, Any], accounts_dir: Path = DEFAULT_ACCOUNTS_DIR) -> Path:
     """同步更新 accounts/<邮箱>.json 单账号文件。"""
     from split_accounts import email_to_filename
@@ -1125,16 +1560,17 @@ _active_codex_backup: CodexEnvBackup | None = None
 
 
 def _install_codex_restore_hooks(backup: CodexEnvBackup) -> None:
-    global _active_codex_backup
+    global _active_codex_backup, _sigint_count
     _active_codex_backup = backup
+    _sigint_count = 0
+    _shutdown_requested.clear()
 
     def _on_exit() -> None:
-        backup.restore()
+        if not _shutdown_requested.is_set():
+            backup.restore()
 
     def _on_signal(signum: int, _frame: Any) -> None:
-        log(f"收到信号 {signum}，正在还原 ~/.codex …")
-        backup.restore()
-        raise SystemExit(128 + signum)
+        _handle_interrupt(signum)
 
     atexit.register(_on_exit)
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1144,7 +1580,7 @@ def _install_codex_restore_hooks(backup: CodexEnvBackup) -> None:
             pass
 
 
-def refresh_one(
+def refresh_one_via_browser(
     account: dict[str, Any],
     *,
     auth_path: Path,
@@ -1161,11 +1597,14 @@ def refresh_one(
     if not password:
         raise ValueError(f"{email}: 缺少 password")
 
+    log(f"{email}: 使用浏览器模拟登录刷新…")
     run_codex_logout()
     if auth_path.exists():
         auth_path.unlink()
 
     login = CodexLoginProcess()
+    global _active_login
+    _active_login = login
     oauth_url = login.start()
 
     try:
@@ -1180,10 +1619,42 @@ def refresh_one(
             cdp_url=cdp_url,
         )
         auth = wait_for_auth(auth_path, login)
+    except KeyboardInterrupt:
+        _handle_interrupt()
     finally:
-        login.wait_done(timeout=60)
+        _active_login = None
+        if _shutdown_requested.is_set():
+            login.terminate()
+        else:
+            login.wait_done(timeout=60)
 
     return merge_auth_into_account(account, auth)
+
+
+def refresh_one(
+    account: dict[str, Any],
+    *,
+    auth_path: Path,
+    headless: bool,
+    chrome_profile: Path,
+    use_system_chrome: bool,
+    cdp_url: str | None,
+    proxy_dir: Path = CLI_PROXY_DIR,
+    force_browser: bool = False,
+) -> dict[str, Any]:
+    if not force_browser:
+        refreshed = try_refresh_via_refresh_token(account, proxy_dir=proxy_dir)
+        if refreshed is not None:
+            return refreshed
+
+    return refresh_one_via_browser(
+        account,
+        auth_path=auth_path,
+        headless=headless,
+        chrome_profile=chrome_profile,
+        use_system_chrome=use_system_chrome,
+        cdp_url=cdp_url,
+    )
 
 
 def main() -> int:
@@ -1228,6 +1699,11 @@ def main() -> int:
         action="store_true",
         help="不同步 ~/.cli-proxy-api/<邮箱>.json",
     )
+    parser.add_argument(
+        "--force-browser",
+        action="store_true",
+        help="跳过 refresh_token API，强制浏览器登录",
+    )
     args = parser.parse_args()
 
     chrome_profile = _system_chrome_user_data() if args.use_main_chrome_profile else args.chrome_profile
@@ -1255,48 +1731,90 @@ def main() -> int:
     )
     _install_codex_restore_hooks(codex_backup)
 
-    ok = fail = 0
-    with codex_backup:
-        for idx, raw in enumerate(targets):
-            key = raw.lower()
-            if key not in index:
-                log(f"跳过 {raw}: 不在 accounts.json")
-                fail += 1
-                continue
-            acc = rows[index[key]]
-            if is_skipped_refreshed(args.need_email, acc["email"]):
-                log(f"跳过 {acc['email']}: need_email.txt 已标记 {REFRESHED_MARK}")
-                continue
-            log(f"========== {acc['email']} ==========")
-            try:
-                rows[index[key]] = refresh_one(
-                    acc,
-                    auth_path=args.auth_file,
-                    headless=args.headless,
-                    chrome_profile=chrome_profile,
-                    use_system_chrome=use_system_chrome,
-                    cdp_url=cdp_url,
-                )
-                if not args.dry_run:
-                    updated = rows[index[key]]
-                    save_accounts(args.accounts, rows)
-                    single_path = save_account_single(updated)
-                    log(f"已更新单账号文件 -> {single_path.name}")
-                    if not args.no_cli_proxy:
-                        sync_cli_proxy_token(updated, proxy_dir=args.cli_proxy_dir)
-                    mark_refreshed_in_need_emails(args.need_email, acc["email"])
-                log(f"成功 {acc['email']}")
-                ok += 1
-            except Exception as exc:  # noqa: BLE001
-                log(f"失败 {raw}: {exc}")
-                fail += 1
+    ok = fail = abandoned = abnormal = 0
+    try:
+        with codex_backup:
+            for idx, raw in enumerate(targets):
+                if _shutdown_requested.is_set():
+                    break
+                key = raw.lower()
+                if key not in index:
+                    log(f"跳过 {raw}: 不在 accounts.json")
+                    fail += 1
+                    continue
+                acc = rows[index[key]]
+                if is_skipped_refreshed(args.need_email, acc["email"]):
+                    log(f"跳过 {acc['email']}: need_email.txt 已标记 {REFRESHED_MARK}")
+                    continue
+                if is_skipped_abandoned(args.need_email, acc["email"]):
+                    log(f"跳过 {acc['email']}: need_email.txt 已标记 {ABANDONED_MARK}")
+                    continue
+                if is_skipped_abnormal(args.need_email, acc["email"]):
+                    log(f"跳过 {acc['email']}: need_email.txt 已标记 {ABNORMAL_MARK}")
+                    continue
+                log(f"========== {acc['email']} ==========")
+                try:
+                    rows[index[key]] = refresh_one(
+                        acc,
+                        auth_path=args.auth_file,
+                        headless=args.headless,
+                        chrome_profile=chrome_profile,
+                        use_system_chrome=use_system_chrome,
+                        cdp_url=cdp_url,
+                        proxy_dir=args.cli_proxy_dir,
+                        force_browser=args.force_browser,
+                    )
+                    if not args.dry_run:
+                        persist_refresh_success(
+                            rows[index[key]],
+                            email=acc["email"],
+                            accounts_path=args.accounts,
+                            rows=rows,
+                            need_email_path=args.need_email,
+                            cli_proxy_dir=args.cli_proxy_dir,
+                            sync_cli_proxy=not args.no_cli_proxy,
+                        )
+                    log(f"成功 {acc['email']}")
+                    ok += 1
+                except MfaChallengeError as exc:
+                    log(f"废弃 {acc['email']}: {exc}")
+                    if not args.dry_run:
+                        persist_account_abandoned(
+                            acc["email"],
+                            need_email_path=args.need_email,
+                            cli_proxy_dir=args.cli_proxy_dir,
+                            sync_cli_proxy=not args.no_cli_proxy,
+                        )
+                    abandoned += 1
+                except AccountAbnormalError as exc:
+                    log(f"异常 {acc['email']}: {exc}")
+                    if not args.dry_run:
+                        persist_account_abnormal(
+                            acc["email"],
+                            need_email_path=args.need_email,
+                            reason="验证码错误",
+                        )
+                    abnormal += 1
+                except KeyboardInterrupt:
+                    _handle_interrupt()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"失败 {raw}: {exc}")
+                    fail += 1
 
-            if idx < len(targets) - 1:
-                log(f"等待 {ACCOUNT_GAP_SEC}s 后处理下一个账号…")
-                time.sleep(ACCOUNT_GAP_SEC)
+                if _shutdown_requested.is_set():
+                    break
+                if idx < len(targets) - 1:
+                    log(f"等待 {ACCOUNT_GAP_SEC}s 后处理下一个账号…")
+                    _interruptible_sleep(ACCOUNT_GAP_SEC)
 
-    log(f"完成: 成功 {ok} 失败 {fail}")
-    return 0 if fail == 0 else 2
+        if _shutdown_requested.is_set():
+            log("用户中断")
+            return 130
+
+        log(f"完成: 成功 {ok} 废弃 {abandoned} 异常 {abnormal} 失败 {fail}")
+        return 0 if fail == 0 else 2
+    except KeyboardInterrupt:
+        _handle_interrupt()
 
 
 if __name__ == "__main__":
