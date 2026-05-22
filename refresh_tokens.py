@@ -56,9 +56,9 @@ OTP_CONTEXT_PATTERNS = [
 REFRESHED_MARK = "已刷新"
 ABANDONED_MARK = "已废弃"
 ABNORMAL_MARK = "异常"
-ACTION_DELAY_SEC = 1  # 浏览器操作之间的间隔（秒）
-ACCOUNT_GAP_SEC = 30  # 每个账号刷新之间的间隔（秒）
-TYPE_CHAR_DELAY_MS = 300  # 逐字符输入间隔（毫秒）
+ACTION_DELAY_SEC = 0.5  # 浏览器操作之间的间隔（秒）
+ACCOUNT_GAP_SEC = 10  # 每个账号刷新之间的间隔（秒）
+TYPE_CHAR_DELAY_MS = 200  # 逐字符输入间隔（毫秒）
 
 # Codex OAuth refresh（与 codex-rs/login 一致）
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -87,8 +87,20 @@ LOGIN_PASSWORD_URL_RE = re.compile(
     r"auth\.openai\.com/log-in/password",
     re.I,
 )
+LOGIN_OR_CREATE_URL_RE = re.compile(
+    r"auth\.openai\.com/log-in-or-create-account",
+    re.I,
+)
+CHOOSE_ACCOUNT_URL_RE = re.compile(
+    r"auth\.openai\.com/choose-an-account",
+    re.I,
+)
 MFA_CHALLENGE_URL_RE = re.compile(
     r"auth\.openai\.com/mfa-challenge",
+    re.I,
+)
+MFA_EMAIL_OTP_URL_RE = re.compile(
+    r"auth\.openai\.com/mfa-challenge/email-otp",
     re.I,
 )
 OTP_ERROR_RE = re.compile(
@@ -101,16 +113,29 @@ OTP_ERROR_RE = re.compile(
     re.I,
 )
 KNOWN_AUTH_PAGE_URL_RE = re.compile(
-    r"auth\.openai\.com/(?:log-in(?:/password)?|email-verification)|"
+    r"auth\.openai\.com/(?:log-in(?:/password|-or-create-account)?|email-verification|mfa-challenge)|"
     r"auth\.openai\.com/sign-in-with-chatgpt/codex/consent|"
     r"localhost:\d+",
     re.I,
 )
 BTN_ANOTHER_ACCOUNT = [
+    "登录至另一个账户", "Sign in to another account",
     "Use another account", "Sign in with a different account", "Log in with another account",
     "使用其他账号", "使用另一个账户", "登录其他帐户", "登录另一个账户", "使用其他帐户",
 ]
+BTN_MFA_TRY_OTHER = [
+    "尝试其他方法", "Try another method", "Use another method", "Try a different method",
+]
+BTN_MFA_EMAIL = [
+    "电子邮件", "Email", "E-mail", "email",
+]
 BTN_SUBMIT = ["Continue", "继续", "Log in", "登录", "Verify", "验证", "Submit", "提交", "Next", "下一步"]
+CHOOSE_ANOTHER_ACCOUNT_RE = re.compile(
+    r"登录(?:至|到)?另一个账户|登录另一个账户|使用另一个账户|登录其他账户|"
+    r"Sign in to another account|Use another account|Log in with another account|"
+    r"Sign in with a different account|Add another account|Add account",
+    re.I,
+)
 
 _shutdown_requested = threading.Event()
 _active_login: Any = None
@@ -537,18 +562,53 @@ def _is_login_email_page(page: Page) -> bool:
     return _auth_path(page.url) == "/log-in"
 
 
+def _is_login_or_create_page(page: Page) -> bool:
+    """https://auth.openai.com/log-in-or-create-account"""
+    return (
+        bool(LOGIN_OR_CREATE_URL_RE.search(page.url))
+        or _auth_path(page.url) == "/log-in-or-create-account"
+    )
+
+
+def _is_choose_account_page(page: Page) -> bool:
+    """https://auth.openai.com/choose-an-account"""
+    return (
+        bool(CHOOSE_ACCOUNT_URL_RE.search(page.url))
+        or _auth_path(page.url) == "/choose-an-account"
+    )
+
+
 def _is_login_password_page(page: Page) -> bool:
     """https://auth.openai.com/log-in/password"""
     return bool(LOGIN_PASSWORD_URL_RE.search(page.url)) or _auth_path(page.url) == "/log-in/password"
 
 
+def _is_mfa_email_otp_page(page: Page) -> bool:
+    """https://auth.openai.com/mfa-challenge/email-otp"""
+    return "mfa-challenge/email-otp" in page.url.lower().split("?", 1)[0]
+
+
+def _is_mfa_challenge_root(page: Page) -> bool:
+    """mfa-challenge 主流程页：/mfa-challenge 或 /mfa-challenge/<session_id>，不含 email-otp。"""
+    if _is_mfa_email_otp_page(page):
+        return False
+    path = _auth_path(page.url)
+    if path == "/mfa-challenge":
+        return True
+    # 例: /mfa-challenge/6a0fab9a0ad88191b6956bdd56de25fc（排除 email-otp）
+    return bool(re.match(r"^/mfa-challenge/(?!email-otp)[^/]+$", path))
+
+
 def _is_mfa_challenge_page(page: Page) -> bool:
-    """https://auth.openai.com/mfa-challenge — 需人工 MFA，账号无法自动刷新。"""
-    return bool(MFA_CHALLENGE_URL_RE.search(page.url)) or _auth_path(page.url) == "/mfa-challenge"
+    return _is_mfa_challenge_root(page) or _is_mfa_email_otp_page(page)
+
+
+def _is_otp_code_page(page: Page) -> bool:
+    return _is_email_verification_page(page) or _is_mfa_email_otp_page(page)
 
 
 class MfaChallengeError(Exception):
-    """遇到 MFA 二次验证页，账号视为废弃。"""
+    """MFA 无法走邮箱验证或其他方式，账号视为废弃。"""
 
 
 class AccountAbnormalError(Exception):
@@ -556,8 +616,8 @@ class AccountAbnormalError(Exception):
 
 
 def _detect_otp_error(page: Page) -> str | None:
-    """检测 email-verification 页上的验证码错误提示。"""
-    if not _is_email_verification_page(page):
+    """检测验证码页（email-verification / mfa email-otp）上的错误提示。"""
+    if not _is_otp_code_page(page):
         return None
 
     snippets: list[str] = []
@@ -598,18 +658,28 @@ def _check_otp_error_or_raise(page: Page) -> None:
 
 
 def _login_page_kind(page: Page) -> str:
-    """按 URL 判定当前登录阶段（不依赖 DOM 猜测）。"""
+    """按 URL + DOM 判定当前登录阶段。"""
     if _is_callback_url(page.url):
         return "callback"
-    if _is_mfa_challenge_page(page):
-        return "mfa_challenge"
+    # 授权页优先（OTP 提交后 URL 可能仍停在 email-otp）
     if _is_codex_consent_page(page):
         return "consent"
+    if _is_mfa_email_otp_page(page):
+        return "mfa_email_otp"
+    if _is_mfa_challenge_root(page):
+        return "mfa_challenge"
     if _is_email_verification_page(page):
         return "email_verification"
     if _is_login_password_page(page):
         return "password"
+    if _is_choose_account_page(page):
+        return "choose_account"
+    if _is_login_or_create_page(page):
+        return "login_or_create"
     if _is_login_email_page(page):
+        # URL 仍为 /log-in 但已出现密码框
+        if _password_visible(page):
+            return "password"
         return "login"
     return "unknown"
 
@@ -670,8 +740,8 @@ def _click_codex_consent_continue(page: Page, timeout: int = 8000) -> bool:
 
 
 def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
-    """邮箱验证码页提交：优先点击「继续」（仅 email-verification URL）。"""
-    if not _is_email_verification_page(page):
+    """验证码页提交：点击「继续」（email-verification / mfa email-otp）。"""
+    if not _is_otp_code_page(page):
         return False
     log("验证码页，点击「继续」")
     _pause(1.5)
@@ -720,25 +790,35 @@ def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
     return _click_text(page, ["继续", "Continue", "Verify", "验证", "Submit", "提交"], timeout=timeout)
 
 
+def _wait_leave_otp_page(page: Page, timeout_sec: int = 20) -> bool:
+    if not _is_otp_code_page(page):
+        return True
+    if _poll_until(lambda: not _is_otp_code_page(page), timeout_sec=timeout_sec):
+        log("已离开验证码页")
+        return True
+    return not _is_otp_code_page(page)
+
+
 def _wait_leave_email_verification(page: Page, timeout_sec: int = 20) -> bool:
-    if not _is_email_verification_page(page):
-        return True
-    if _poll_until(lambda: not _is_email_verification_page(page), timeout_sec=timeout_sec):
-        log("已离开邮箱验证码页")
-        return True
-    return not _is_email_verification_page(page)
+    return _wait_leave_otp_page(page, timeout_sec=timeout_sec)
 
 
 def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
-    """OAuth/账户选择页：点击「登录另一个账户」进入 log-in。"""
+    """OAuth/账户选择页：点击「登录至另一个账户」等进入 log-in（非 MFA 页）。"""
     if (
         _is_login_email_page(page)
+        or _is_login_or_create_page(page)
         or _is_login_password_page(page)
         or _is_email_verification_page(page)
+        or _is_mfa_challenge_page(page)
         or _is_codex_consent_page(page)
         or _is_callback_url(page.url)
+        or "auth.openai.com/mfa-challenge" in page.url.lower()
     ):
         return False
+
+    if _is_choose_account_page(page):
+        return _click_choose_another_account(page, timeout=timeout)
 
     log("选择「登录另一个账户」")
     for text in BTN_ANOTHER_ACCOUNT:
@@ -768,6 +848,110 @@ def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
         return True
 
     return False
+
+
+def _click_locator_if_match(
+    loc: Any,
+    pattern: re.Pattern[str],
+    *,
+    timeout: int = 10000,
+) -> bool:
+    try:
+        count = loc.count()
+    except Exception:  # noqa: BLE001
+        return False
+    for i in range(min(count, 12)):
+        try:
+            el = loc.nth(i)
+            if not el.is_visible():
+                continue
+            text = (el.inner_text(timeout=2000) or "").strip()
+            if text and not pattern.search(text):
+                continue
+            el.scroll_into_view_if_needed(timeout=3000)
+            try:
+                el.click(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                el.click(timeout=timeout, force=True)
+            _pause(2)
+            log(f"已点击: {text[:48]}")
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
+    """choose-an-account 页：多种方式点击「登录至另一个账户」。"""
+    if not _is_choose_account_page(page):
+        return False
+
+    log("choose-an-account 页，点击「登录至另一个账户」")
+    _pause(1)
+
+    candidates = [
+        page.get_by_role("button", name=CHOOSE_ANOTHER_ACCOUNT_RE),
+        page.get_by_role("link", name=CHOOSE_ANOTHER_ACCOUNT_RE),
+        page.get_by_text(CHOOSE_ANOTHER_ACCOUNT_RE),
+        page.locator("button, a, [role='button'], [role='link']").filter(
+            has_text=CHOOSE_ANOTHER_ACCOUNT_RE
+        ),
+        page.locator("button, a, [role='button'], [role='link']"),
+    ]
+    for loc in candidates:
+        if _click_locator_if_match(loc, CHOOSE_ANOTHER_ACCOUNT_RE, timeout=timeout):
+            if _poll_until(lambda: not _is_choose_account_page(page), timeout_sec=12):
+                log("已离开 choose-an-account 页")
+                return True
+            log("点击后仍在 choose-an-account，尝试下一种方式…")
+
+    try:
+        text_loc = page.get_by_text(CHOOSE_ANOTHER_ACCOUNT_RE)
+        for i in range(min(text_loc.count(), 6)):
+            el = text_loc.nth(i)
+            if not el.is_visible():
+                continue
+            for xpath in (
+                "xpath=ancestor-or-self::button[1]",
+                "xpath=ancestor-or-self::a[1]",
+                "xpath=ancestor-or-self::*[@role='button'][1]",
+                "xpath=ancestor-or-self::*[@role='link'][1]",
+            ):
+                try:
+                    target = el.locator(xpath)
+                    if target.count() > 0 and target.first.is_visible():
+                        target.first.click(timeout=timeout, force=True)
+                        _pause(2)
+                        if not _is_choose_account_page(page):
+                            log("已通过祖先元素点击离开 choose-an-account")
+                            return True
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        hints: list[str] = []
+        for sel in ("button", "a", "[role=button]", "[role=link]"):
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 15)):
+                try:
+                    t = (loc.nth(i).inner_text(timeout=500) or "").strip()
+                    if t and len(t) < 80:
+                        hints.append(t)
+                except Exception:  # noqa: BLE001
+                    pass
+        if hints:
+            log(f"choose-an-account 未点到，页内可见: {hints[:8]}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return False
+
+
+def _handle_choose_account(page: Page) -> bool:
+    """choose-an-account 页点击「登录至另一个账户」。"""
+    return _click_choose_another_account(page)
 
 
 def _click_text(page: Page, texts: list[str], timeout: int = 8000) -> bool:
@@ -877,6 +1061,8 @@ def _email_visible(page: Page) -> bool:
 
 
 def _handle_login_email(page: Page, email: str) -> bool:
+    if _is_login_password_page(page) or _password_visible(page):
+        return False
     if not _is_login_email_page(page):
         return False
     if not _email_visible(page):
@@ -891,11 +1077,60 @@ def _handle_login_email(page: Page, email: str) -> bool:
     return True
 
 
+def _wait_after_login_email(page: Page, timeout_sec: int = 15) -> None:
+    """邮箱提交后等待下一页（URL 可能仍为 /log-in，需看 DOM）。"""
+
+    def ready() -> bool:
+        if _password_visible(page) or _is_login_password_page(page):
+            return True
+        if _is_email_verification_page(page) or _is_mfa_challenge_page(page):
+            return True
+        if _is_codex_consent_page(page) or _is_callback_url(page.url):
+            return True
+        return not _is_login_email_page(page)
+
+    if _poll_until(ready, timeout_sec=timeout_sec):
+        log("邮箱提交后已进入下一页")
+
+
+def _wait_after_otp_submit(page: Page, timeout_sec: int = 20) -> bool:
+    """验证码提交后等待离开 OTP 或进入授权页。"""
+
+    def ready() -> bool:
+        if _is_codex_consent_page(page) or _is_callback_url(page.url):
+            return True
+        return not _is_otp_code_page(page)
+
+    return _poll_until(ready, timeout_sec=timeout_sec)
+
+
+def _handle_login_or_create_email(page: Page, email: str) -> bool:
+    if not _is_login_or_create_page(page):
+        return False
+    if not _email_visible(page):
+        log("log-in-or-create-account 页未找到邮箱输入框")
+        return False
+    log(f"log-in-or-create-account 页填写邮箱: {email}")
+    _fill_and_go(
+        page,
+        email,
+        ['input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]', 'input[id*="email"]'],
+    )
+    return True
+
+
 def _wait_leave_login_email(page: Page, timeout_sec: int = 25) -> None:
     if not _is_login_email_page(page):
         return
     if _poll_until(lambda: not _is_login_email_page(page), timeout_sec=timeout_sec):
         log("已离开 log-in 邮箱页")
+
+
+def _wait_leave_login_or_create(page: Page, timeout_sec: int = 25) -> None:
+    if not _is_login_or_create_page(page):
+        return
+    if _poll_until(lambda: not _is_login_or_create_page(page), timeout_sec=timeout_sec):
+        log("已离开 log-in-or-create-account 页")
 
 
 def _wait_after_password(page: Page, timeout_sec: int = 25) -> None:
@@ -962,10 +1197,17 @@ def _fill_split_otp_inputs(page: Page, code: str) -> bool:
 
 
 def _fill_otp(page: Page, mailapi_url: str) -> bool:
-    if not _is_email_verification_page(page):
+    if _is_codex_consent_page(page) or _is_callback_url(page.url):
+        log("验证码已完成，已进入授权/回调页")
+        return True
+    if not _is_otp_code_page(page):
         return False
-    log("email-verification 页填写验证码")
+    page_label = "mfa email-otp" if _is_mfa_email_otp_page(page) else "email-verification"
+    log(f"{page_label} 页填写验证码")
     if not _otp_visible(page):
+        if _is_codex_consent_page(page):
+            log("验证码页已跳转至授权页")
+            return True
         log("验证码页未找到输入框，等待…")
         return False
 
@@ -975,6 +1217,9 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
 
     if _fill_split_otp_inputs(page, code):
         _pause()
+        if _wait_after_otp_submit(page, timeout_sec=8):
+            log("验证码输入后已自动进入下一页")
+            return True
     else:
         otp_input = _first_visible(
             page,
@@ -988,21 +1233,121 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
             timeout=5000,
         )
         if not otp_input:
+            if _is_codex_consent_page(page):
+                return True
             log("未找到验证码输入框")
             return False
         _type_chars(otp_input, code)
         _pause(1.5)
+        if _wait_after_otp_submit(page, timeout_sec=6):
+            log("验证码输入后已自动进入下一页")
+            return True
+
+    if _is_codex_consent_page(page) or _is_callback_url(page.url):
+        return True
+    if not _is_otp_code_page(page):
+        return True
 
     if not _click_otp_submit(page):
         log("未点到「继续」，尝试 Enter")
         page.keyboard.press("Enter")
         _pause()
     _pause(1.5)
-    _check_otp_error_or_raise(page)
-    if not _wait_leave_email_verification(page, timeout_sec=20):
+
+    if _is_codex_consent_page(page) or _is_callback_url(page.url):
+        log("已进入授权/回调页")
+        return True
+
+    if _is_otp_code_page(page):
+        _check_otp_error_or_raise(page)
+
+    if _wait_after_otp_submit(page, timeout_sec=20):
+        return True
+
+    if _is_otp_code_page(page):
         _check_otp_error_or_raise(page)
         log("提交后仍在验证码页")
     return True
+
+
+def _wait_mfa_email_otp_page(page: Page, timeout_sec: float = 30) -> bool:
+    """等待跳转到 mfa-challenge/email-otp（wait_for_url + 轮询双保险）。"""
+    if _is_mfa_email_otp_page(page):
+        log("已进入 MFA 邮箱验证码页 email-otp")
+        return True
+
+    deadline = time.time() + timeout_sec
+    remain_ms = max(1000, int((deadline - time.time()) * 1000))
+    try:
+        page.wait_for_url(re.compile(r"mfa-challenge/email-otp", re.I), timeout=min(remain_ms, 25000))
+        log("已进入 MFA 邮箱验证码页 email-otp")
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    if _poll_until(lambda: _is_mfa_email_otp_page(page), timeout_sec=max(1, deadline - time.time())):
+        log("已进入 MFA 邮箱验证码页 email-otp")
+        return True
+
+    log(f"未能进入 mfa-challenge/email-otp，当前 URL: {page.url.split('?', 1)[0]}")
+    return False
+
+
+def _advance_mfa_to_email_otp(page: Page) -> bool:
+    """
+    mfa-challenge 根路径：尝试其他方法 → 选电子邮件 → 等待 email-otp。
+    任一步失败返回 False（调用方标记账号废弃）。
+    """
+    if _is_mfa_email_otp_page(page):
+        return True
+    if not _is_mfa_challenge_root(page):
+        return False
+
+    log(f"MFA 页，点击「尝试其他方法」 ({page.url.split('?', 1)[0]})")
+    if not _click_text(page, BTN_MFA_TRY_OTHER, timeout=8000):
+        log("未找到「尝试其他方法」")
+        return False
+    _pause(2)
+
+    if _is_mfa_email_otp_page(page):
+        return True
+    if not _is_mfa_challenge_root(page):
+        log(f"MFA 中间页非预期: {page.url.split('?', 1)[0]}")
+        return False
+
+    log("MFA 页，选择「电子邮件」")
+    if not _click_text(page, BTN_MFA_EMAIL, timeout=8000):
+        log("未找到「电子邮件」验证方式")
+        return False
+    _pause(1)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _wait_mfa_email_otp_page(page, timeout_sec=30)
+
+
+def _process_otp_step(page: Page, mailapi_url: str, otp_submitted: bool) -> bool:
+    """处理验证码页（email-verification / mfa email-otp），返回是否已提交过验证码。"""
+    if _is_codex_consent_page(page) or _is_callback_url(page.url):
+        return False
+    if otp_submitted:
+        if _is_codex_consent_page(page) or not _is_otp_code_page(page):
+            return False
+        log("验证码已填，重试点击「继续」…")
+        _click_otp_submit(page)
+        _pause(1.5)
+        if _wait_after_otp_submit(page, timeout_sec=15):
+            return False
+        if _is_otp_code_page(page):
+            _check_otp_error_or_raise(page)
+        return True
+    if _fill_otp(page, mailapi_url):
+        if not _is_otp_code_page(page) or _is_codex_consent_page(page):
+            return False
+        return True
+    return otp_submitted
 
 
 def _advance_login_flow(
@@ -1016,13 +1361,17 @@ def _advance_login_flow(
     """
     严格按 URL 执行操作，避免在错误页面点击「继续」：
 
-    log-in → 填邮箱
+    log-in-or-create-account / log-in → 填邮箱
+    choose-an-account → 登录至另一个账户
     log-in/password → 填密码
-    email-verification → 填验证码 + 继续
+    email-verification / mfa email-otp → 填验证码 + 继续
+    mfa-challenge → 尝试其他方法 → 电子邮件 → email-otp
     codex/consent → 授权继续
     """
     deadline = time.time() + timeout_sec
     otp_submitted = False
+    login_email_done = False
+    choose_account_tries = 0
     last_kind = ""
 
     while time.time() < deadline:
@@ -1042,40 +1391,59 @@ def _advance_login_flow(
             return
 
         if kind == "mfa_challenge":
-            raise MfaChallengeError(f"遇到 MFA 验证页: {page.url.split('?', 1)[0]}")
+            otp_submitted = False
+            if not _advance_mfa_to_email_otp(page):
+                raise MfaChallengeError(f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}")
+            _pause(2)
+            continue
+
+        if kind == "login_or_create":
+            otp_submitted = False
+            if _handle_login_or_create_email(page, email):
+                login_email_done = True
+                _wait_after_login_email(page)
+            _pause(1)
+            continue
+
+        if kind == "choose_account":
+            otp_submitted = False
+            choose_account_tries += 1
+            if choose_account_tries > 6:
+                raise RuntimeError(
+                    "choose-an-account 页多次未能点击「登录至另一个账户」，请检查页面文案或手动登录"
+                )
+            if _handle_choose_account(page):
+                choose_account_tries = 0
+                _wait_known_auth_page(page, timeout_sec=15)
+            _pause(2)
+            continue
 
         if kind == "login":
             otp_submitted = False
+            if login_email_done or _password_visible(page) or _is_login_password_page(page):
+                _pause(1)
+                continue
             if _handle_login_email(page, email):
-                _wait_leave_login_email(page)
-                _wait_known_auth_page(page)
-            _pause(2)
+                login_email_done = True
+                _wait_after_login_email(page)
+            _pause(1)
             continue
 
         if kind == "password":
             otp_submitted = False
+            login_email_done = True
             if _fill_password(page, password):
                 _wait_after_password(page)
                 _wait_known_auth_page(page)
             _pause(2)
             continue
 
-        if kind == "email_verification":
-            if otp_submitted:
-                log("验证码已填，重试点击「继续」…")
-                _click_otp_submit(page)
-                _pause(1.5)
-                _check_otp_error_or_raise(page)
-                _wait_leave_email_verification(page, timeout_sec=15)
-                if not _is_email_verification_page(page):
-                    otp_submitted = False
-                else:
-                    _check_otp_error_or_raise(page)
-            elif _fill_otp(page, mailapi_url):
-                otp_submitted = True
-                if not _is_email_verification_page(page):
-                    otp_submitted = False
-            _pause(2)
+        if kind in ("email_verification", "mfa_email_otp"):
+            if _is_codex_consent_page(page):
+                _pause(1)
+                continue
+            otp_submitted = _process_otp_step(page, mailapi_url, otp_submitted)
+            _pause(1)
             continue
 
         if kind == "consent":
@@ -1088,6 +1456,18 @@ def _advance_login_flow(
             continue
 
         # OAuth 账户选择 / authorize 等中间页：先点「登录另一个账户」
+        if _is_mfa_challenge_page(page):
+            if _is_mfa_email_otp_page(page):
+                otp_submitted = _process_otp_step(page, mailapi_url, otp_submitted)
+            else:
+                otp_submitted = False
+                if not _advance_mfa_to_email_otp(page):
+                    raise MfaChallengeError(
+                        f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}"
+                    )
+            _pause(2)
+            continue
+
         if _try_another_account(page):
             _wait_known_auth_page(page, timeout_sec=15)
             continue
