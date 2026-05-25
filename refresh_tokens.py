@@ -1805,6 +1805,19 @@ def _system_chrome_user_data() -> Path:
     return MAC_CHROME_USER_DATA
 
 
+def _reset_chrome_profile_if_needed(chrome_profile: Path) -> None:
+    """每次启动前清空项目内 .chrome-profile，避免上次登录账号残留。"""
+    if chrome_profile.name != ".chrome-profile":
+        return
+    if not chrome_profile.exists():
+        return
+    try:
+        shutil.rmtree(chrome_profile)
+        log(f"已清除 Chrome 配置: {chrome_profile}")
+    except OSError as exc:
+        log(f"清除 Chrome 配置失败: {exc}")
+
+
 def _launch_browser_context(
     p: Any,
     *,
@@ -1832,6 +1845,7 @@ def _launch_browser_context(
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         return browser, context, False
 
+    _reset_chrome_profile_if_needed(chrome_profile)
     chrome_profile.mkdir(parents=True, exist_ok=True)
     channel = "chrome" if use_system_chrome else None
     log(
