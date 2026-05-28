@@ -99,7 +99,7 @@ def _fetch_session_in_browser(page: Page) -> dict[str, Any]:
     try:
         if not _is_on_chatgpt_site(page):
             rt._open_oauth_url(page, CHATGPT_HOME_URL)
-            rt._pause(0.5)
+            rt._pause(0)
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
             except Exception:  # noqa: BLE001
@@ -352,14 +352,14 @@ def _click_chatgpt_header_login(page: Page, *, timeout: int = 10000) -> bool:
         btn.scroll_into_view_if_needed(timeout=3000)
         btn.click(timeout=timeout)
         rt.log("已点击 ChatGPT 登录按钮")
-        rt._pause(1.5)
+        rt._pause(0)
         return True
     except Exception as exc:  # noqa: BLE001
         rt.log(f"点击登录按钮失败，尝试 force: {exc}")
         try:
             btn.click(timeout=timeout, force=True)
             rt.log("已 force 点击 ChatGPT 登录按钮")
-            rt._pause(1.5)
+            rt._pause(0)
             return True
         except Exception as exc2:  # noqa: BLE001
             rt.log(f"force 点击登录按钮仍失败: {exc2}")
@@ -391,7 +391,7 @@ def _fill_email_any(page: Page, email: str) -> bool:
     rt._pause()
     # 优先 Enter 提交，避免误点「Continue with Google」
     el.press("Enter")
-    rt._pause(1.5)
+    rt._pause(0)
     if _email_visible_any(page):
         if not _click_form_continue(root):
             rt.log("Enter 未跳转，尝试精确点击「继续」")
@@ -409,11 +409,11 @@ def _fill_password_any(page: Page, password: str) -> bool:
     rt._type_chars(pwd, password)
     rt._pause()
     pwd.press("Enter")
-    rt._pause(1)
+    rt._pause(0)
     if _password_visible_any(page):
         if not _click_form_continue(root):
             root.keyboard.press("Enter")
-    rt._pause(0.3)
+    rt._pause(0)
     return True
 
 
@@ -466,7 +466,7 @@ def _web_click_otp_submit(root: Any, page: Page, *, timeout: int = 10000) -> boo
     ):
         return False
     rt.log("email-verification 页，点击「继续」")
-    rt._pause(1.5)
+    rt._pause(0)
     for loc in (
         root.get_by_role("button", name="继续"),
         root.get_by_role("button", name=re.compile(r"^\s*继续\s*$")),
@@ -481,7 +481,7 @@ def _web_click_otp_submit(root: Any, page: Page, *, timeout: int = 10000) -> boo
             for _ in range(24):
                 if btn.is_enabled():
                     break
-                rt._pause(0.25)
+                rt._pause(0)
             btn.click(timeout=timeout)
             rt._pause()
             rt.log("已点击 email-verification「继续」")
@@ -505,7 +505,7 @@ def _web_wait_after_otp_submit(page: Page, root: Any, *, timeout_sec: float = 20
     return rt._poll_until(ready, timeout_sec=timeout_sec)
 
 
-def _web_fill_otp(page: Page, mailapi_url: str) -> bool:
+def _web_fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> bool:
     """https://auth.openai.com/email-verification 获取验证码、输入并提交。"""
     root = _primary_otp_root(page)
     if root is None:
@@ -532,7 +532,7 @@ def _web_fill_otp(page: Page, mailapi_url: str) -> bool:
         return False
 
     rt.log("轮询 mailapi 获取邮箱验证码…")
-    code = rt.fetch_email_code(mailapi_url)
+    code = rt._fetch_otp_code_from_mail(mailapi_url, refetch=refetch)
     rt._pause()
 
     if rt._fill_split_otp_inputs(root, code):
@@ -556,7 +556,7 @@ def _web_fill_otp(page: Page, mailapi_url: str) -> bool:
             rt.log("未找到验证码输入框")
             return False
         rt._type_chars(otp_input, code)
-        rt._pause(1.5)
+        rt._pause(0)
         if _web_wait_after_otp_submit(page, root, timeout_sec=6):
             rt.log("验证码输入后已进入下一页")
             return True
@@ -565,7 +565,7 @@ def _web_fill_otp(page: Page, mailapi_url: str) -> bool:
         rt.log("未点到「继续」，尝试 Enter")
         root.keyboard.press("Enter")
         rt._pause()
-    rt._pause(1.5)
+    rt._pause(0)
 
     if _web_wait_after_otp_submit(page, root, timeout_sec=20):
         return True
@@ -594,12 +594,27 @@ def _web_process_otp_step(page: Page, mailapi_url: str, otp_submitted: bool) -> 
         root = _primary_otp_root(page)
         if root is None or not _is_still_on_otp_page(page, root):
             return False
+        if rt._detect_otp_error(root):
+            rt.log(f"验证码错误，{rt.OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
+            if _web_fill_otp(page, mailapi_url, refetch=True):
+                root = _primary_otp_root(page)
+                if root is None or not _is_still_on_otp_page(page, root):
+                    return False
+                return True
+            return True
         rt.log("验证码已填，重试点击「继续」…")
         _web_click_otp_submit(root, page)
-        rt._pause(1.5)
+        rt._pause(0)
         if _web_wait_after_otp_submit(page, root, timeout_sec=15):
             return False
         if _is_still_on_otp_page(page, root):
+            if rt._detect_otp_error(root):
+                rt.log(f"验证码错误，{rt.OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
+                if _web_fill_otp(page, mailapi_url, refetch=True):
+                    root = _primary_otp_root(page)
+                    if root is None or not _is_still_on_otp_page(page, root):
+                        return False
+                    return True
             rt._check_otp_error_or_raise(root)
         return True
 
@@ -616,20 +631,20 @@ def _web_handle_choose_account(page: Page) -> bool:
         if "choose-an-account" not in _root_url(root, page):
             continue
         rt.log("choose-an-account 弹窗，点击「登录至另一个账户」")
-        rt._pause(1)
+        rt._pause(0)
         for exact_text in ("登录至另一个帐户", "登录至另一个账户", "Sign in to another account"):
             try:
                 loc = root.get_by_text(exact_text, exact=True)
                 if loc.count() > 0 and loc.first.is_visible():
                     loc.first.click(timeout=10000)
-                    rt._pause(2)
+                    rt._pause(0)
                     rt.log(f"已点击: {exact_text}")
                     return True
             except Exception:  # noqa: BLE001
                 pass
         for text in rt.BTN_ANOTHER_ACCOUNT:
             if _click_text_on_root(root, [text], timeout=8000):
-                rt._pause(2)
+                rt._pause(0)
                 return True
     return rt._handle_choose_account(page)
 
@@ -640,9 +655,9 @@ def _web_advance_mfa_to_email_otp(page: Page) -> bool:
         if "mfa-challenge" not in url or "email-otp" in url:
             continue
         if rt._click_text(root, rt.BTN_MFA_TRY_OTHER, timeout=8000):
-            rt._pause(1)
+            rt._pause(0)
         if rt._click_text(root, rt.BTN_MFA_EMAIL, timeout=8000):
-            rt._pause(2)
+            rt._pause(0)
             return True
     return rt._advance_mfa_to_email_otp(page)
 
@@ -668,7 +683,7 @@ def _wait_after_modal_email(page: Page, *, timeout_sec: float = 15) -> None:
 def fetch_session_from_page(page: Page) -> dict[str, Any]:
     """导航到 session 页并解析 body JSON。"""
     rt._open_oauth_url(page, SESSION_URL)
-    rt._pause(0.5)
+    rt._pause(0)
     try:
         text = page.evaluate("() => document.body ? document.body.innerText : ''")
         text = (text or "").strip()
@@ -756,33 +771,33 @@ def advance_web_login_flow(
                 rt.log("ChatGPT 已登录")
                 return
             if _open_chatgpt_login_modal(page):
-                rt._pause(1)
+                rt._pause(0)
             continue
 
         if kind == "callback":
             rt.log("意外进入 OAuth 回调…")
             if _has_session_cookie(page):
                 return
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         if kind == "mfa_challenge":
             otp_submitted = False
             if not _web_advance_mfa_to_email_otp(page):
                 raise rt.MfaChallengeError(f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}")
-            rt._pause(2)
+            rt._pause(0)
             continue
 
         if kind == "login_or_create":
             otp_submitted = False
             if login_email_done or rt._password_visible(page) or _password_visible_any(page):
-                rt._pause(1)
+                rt._pause(0)
                 continue
             if _fill_email_any(page, email) or rt._handle_login_or_create_email(page, email):
                 login_email_done = True
                 _wait_after_modal_email(page)
                 rt._wait_after_login_email(page)
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         if kind == "choose_account":
@@ -795,19 +810,19 @@ def advance_web_login_flow(
             if _web_handle_choose_account(page):
                 choose_account_tries = 0
                 rt._wait_known_auth_page(page, timeout_sec=15)
-            rt._pause(2)
+            rt._pause(0)
             continue
 
         if kind == "login":
             otp_submitted = False
             if login_email_done or rt._password_visible(page) or _password_visible_any(page) or rt._is_login_password_page(page):
-                rt._pause(1)
+                rt._pause(0)
                 continue
             if _fill_email_any(page, email) or rt._handle_login_email(page, email):
                 login_email_done = True
                 _wait_after_modal_email(page)
                 rt._wait_after_login_email(page)
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         if kind == "password":
@@ -824,7 +839,7 @@ def advance_web_login_flow(
 
         if kind in ("email_verification", "mfa_email_otp"):
             otp_submitted = _web_process_otp_step(page, mailapi_url, otp_submitted)
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         if kind == "consent":
@@ -832,7 +847,7 @@ def advance_web_login_flow(
             if _has_session_cookie(page):
                 return
             rt._open_oauth_url(page, CHATGPT_HOME_URL)
-            rt._pause(2)
+            rt._pause(0)
             continue
 
         if rt._is_mfa_challenge_page(page) or any(
@@ -848,7 +863,7 @@ def advance_web_login_flow(
                     raise rt.MfaChallengeError(
                         f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}"
                     )
-            rt._pause(2)
+            rt._pause(0)
             continue
 
         if _is_chatgpt_homepage(page) and not login_email_done:
@@ -859,7 +874,7 @@ def advance_web_login_flow(
                 if _fill_email_any(page, email):
                     login_email_done = True
                     _wait_after_modal_email(page)
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         if rt._try_another_account(page):
@@ -868,12 +883,12 @@ def advance_web_login_flow(
 
         if _is_email_verification_any(page) or _otp_visible_any(page):
             otp_submitted = _web_process_otp_step(page, mailapi_url, otp_submitted)
-            rt._pause(1)
+            rt._pause(0)
             continue
 
         rt.log(f"等待已知登录页… {page.url[:90]}")
         rt._wait_known_auth_page(page, timeout_sec=10)
-        rt._pause(1)
+        rt._pause(0)
 
     if _has_session_cookie(page):
         rt.log("超时前检测到 session cookie")
@@ -910,7 +925,7 @@ def browser_web_session_login(
         try:
             rt.log(f"打开 ChatGPT: {CHATGPT_HOME_URL}")
             rt._open_oauth_url(page, CHATGPT_HOME_URL)
-            rt._pause(1)
+            rt._pause(0)
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
             except Exception:  # noqa: BLE001

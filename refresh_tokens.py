@@ -56,9 +56,11 @@ OTP_CONTEXT_PATTERNS = [
 REFRESHED_MARK = "已刷新"
 ABANDONED_MARK = "已废弃"
 ABNORMAL_MARK = "异常"
-ACTION_DELAY_SEC = 0.5  # 浏览器操作之间的间隔（秒）
+ACTION_DELAY_SEC = 0  # 浏览器操作之间的间隔（秒）
+OTP_PAGE_DELAY_SEC = 5  # 进入验证码页后、首次拉取邮箱前的等待（秒）
+OTP_MAIL_POLL_INTERVAL_SEC = 5  # mailapi 轮询间隔（秒）
 ACCOUNT_GAP_SEC = 10  # 每个账号刷新之间的间隔（秒）
-TYPE_CHAR_DELAY_MS = 200  # 逐字符输入间隔（毫秒）
+TYPE_CHAR_DELAY_MS = 0  # 逐字符输入间隔（毫秒）
 
 # Codex OAuth refresh（与 codex-rs/login 一致）
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -101,6 +103,10 @@ MFA_CHALLENGE_URL_RE = re.compile(
 )
 MFA_EMAIL_OTP_URL_RE = re.compile(
     r"auth\.openai\.com/mfa-challenge/email-otp",
+    re.I,
+)
+PHONE_VERIFICATION_URL_RE = re.compile(
+    r"auth\.openai\.com/phone-verification",
     re.I,
 )
 OTP_ERROR_RE = re.compile(
@@ -420,7 +426,38 @@ def extract_code_from_mailapi(mail_data: dict[str, Any]) -> str | None:
     return Counter(hits).most_common(1)[0][0]
 
 
-def fetch_email_code(mailapi_url: str, timeout: int = 180, interval: int = 5) -> str:
+def _peek_email_code(mailapi_url: str) -> str | None:
+    """单次读取 mailapi 当前验证码（不等待、不轮询）。"""
+    try:
+        resp = requests.get(mailapi_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    status = str(data.get("status", "")).lower()
+    if status and status not in ("success", "ok", ""):
+        return None
+    return extract_code_from_mailapi(data)
+
+
+def fetch_email_code(
+    mailapi_url: str,
+    timeout: int = 180,
+    interval: int = OTP_MAIL_POLL_INTERVAL_SEC,
+    *,
+    initial_delay: float = 0,
+    ignore_codes: set[str] | frozenset[str] | None = None,
+) -> str:
+    """轮询 mailapi 获取验证码。
+
+    initial_delay: 首次请求前等待（邮件送达缓冲）
+    ignore_codes: 忽略旧验证码（重新获取时使用）
+    """
+    ignore = set(ignore_codes or ())
+    if initial_delay > 0:
+        log(f"等待 {initial_delay:g}s 后开始从邮箱获取验证码…")
+        _interruptible_sleep(initial_delay)
+
     deadline = time.time() + timeout
     last_error = ""
     while time.time() < deadline:
@@ -444,9 +481,15 @@ def fetch_email_code(mailapi_url: str, timeout: int = 180, interval: int = 5) ->
 
         code = extract_code_from_mailapi(data)
         if code:
+            if code in ignore:
+                last_error = f"仍为已忽略验证码 {code}"
+                log(f"邮箱仍是已忽略的验证码 {code}，{interval}s 后重试…")
+                _interruptible_sleep(interval)
+                continue
             log(f"验证码: {code} (from={data.get('from', '?')})")
             return code
 
+        last_error = "邮箱暂无验证码"
         _interruptible_sleep(interval)
 
     raise TimeoutError(f"等待邮箱验证码超时 ({timeout}s): {last_error}")
@@ -628,12 +671,24 @@ def _is_mfa_challenge_page(page: Page) -> bool:
     return _is_mfa_challenge_root(page) or _is_mfa_email_otp_page(page)
 
 
+def _is_phone_verification_page(page: Page) -> bool:
+    """https://auth.openai.com/phone-verification"""
+    return (
+        "phone-verification" in page.url.lower().split("?", 1)[0]
+        or _auth_path(page.url) == "/phone-verification"
+    )
+
+
 def _is_otp_code_page(page: Page) -> bool:
     return _is_email_verification_page(page) or _is_mfa_email_otp_page(page)
 
 
 class MfaChallengeError(Exception):
     """MFA 无法走邮箱验证或其他方式，账号视为废弃。"""
+
+
+class PhoneVerificationError(Exception):
+    """OAuth 流程遇到手机验证，需改用 session API 获取 access_token。"""
 
 
 class AccountAbnormalError(Exception):
@@ -699,6 +754,8 @@ def _login_page_kind(page: Page) -> str:
         return "password"
     if _is_choose_account_page(page):
         return "choose_account"
+    if _is_phone_verification_page(page):
+        return "phone_verification"
     if _is_login_or_create_page(page):
         return "login_or_create"
     if _is_login_email_page(page):
@@ -742,7 +799,7 @@ def _click_codex_consent_continue(page: Page, timeout: int = 8000) -> bool:
         return False
 
     log("Codex 授权页，点击「继续」")
-    _pause(1)
+    _pause(0)
 
     # 优先精确匹配「继续」
     for loc in (
@@ -757,7 +814,7 @@ def _click_codex_consent_continue(page: Page, timeout: int = 8000) -> bool:
             for _ in range(24):
                 if target.is_enabled():
                     break
-                _pause(0.25)
+                _pause(0)
             if not target.is_enabled():
                 log("授权页「继续」按钮不可用，可能已完成授权")
                 return False
@@ -793,7 +850,7 @@ def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
     if not _is_otp_code_page(page):
         return False
     log("验证码页，点击「继续」")
-    _pause(1.5)
+    _pause(0)
 
     for loc in (
         page.get_by_role("button", name="继续"),
@@ -809,7 +866,7 @@ def _click_otp_submit(page: Page, timeout: int = 10000) -> bool:
             for _ in range(24):
                 if btn.is_enabled():
                     break
-                _pause(0.25)
+                _pause(0)
             btn.click(timeout=timeout)
             _pause()
             log("已点击验证码页「继续」")
@@ -876,7 +933,7 @@ def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
             try:
                 if loc.count() > 0 and loc.first.is_visible():
                     loc.first.click(timeout=timeout)
-                    _pause(2)
+                    _pause(0)
                     log(f"已点击「{text}」")
                     return True
             except Exception:  # noqa: BLE001
@@ -885,14 +942,14 @@ def _try_another_account(page: Page, *, timeout: int = 8000) -> bool:
         try:
             if loc.count() > 0 and loc.first.is_visible():
                 loc.first.click(timeout=timeout)
-                _pause(2)
+                _pause(0)
                 log(f"已点击「{text}」")
                 return True
         except Exception:  # noqa: BLE001
             pass
 
     if _click_text(page, BTN_ANOTHER_ACCOUNT, timeout=timeout):
-        _pause(2)
+        _pause(0)
         log("已点击「登录另一个账户」")
         return True
 
@@ -952,7 +1009,7 @@ def _click_locator_if_match(
                 el.click(timeout=timeout)
             except Exception:  # noqa: BLE001
                 el.click(timeout=timeout, force=True)
-            _pause(2)
+            _pause(0)
             log(f"已点击: {label[:48]}")
             return True
         except Exception:  # noqa: BLE001
@@ -966,7 +1023,7 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
         return False
 
     log("choose-an-account 页，点击「登录至另一个账户」")
-    _pause(1)
+    _pause(0)
 
     # 页面常见繁体「帐户」，优先精确点击
     for exact_text in ("登录至另一个帐户", "登录至另一个账户", "Sign in to another account"):
@@ -974,7 +1031,7 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
             loc = page.get_by_text(exact_text, exact=True)
             if loc.count() > 0 and loc.first.is_visible():
                 loc.first.click(timeout=timeout)
-                _pause(2)
+                _pause(0)
                 log(f"已点击: {exact_text}")
                 if _poll_until(lambda: not _is_choose_account_page(page), timeout_sec=12):
                     log("已离开 choose-an-account 页")
@@ -1037,7 +1094,7 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
                     target = el.locator(xpath)
                     if target.count() > 0 and target.first.is_visible():
                         target.first.click(timeout=timeout, force=True)
-                        _pause(2)
+                        _pause(0)
                         if not _is_choose_account_page(page):
                             log("已通过祖先元素点击离开 choose-an-account")
                             return True
@@ -1068,6 +1125,84 @@ def _click_choose_another_account(page: Page, *, timeout: int = 10000) -> bool:
 def _handle_choose_account(page: Page) -> bool:
     """choose-an-account 页点击「登录至另一个账户」。"""
     return _click_choose_another_account(page)
+
+
+def _click_current_account_on_choose_page(page: Page, email: str, *, timeout: int = 10000) -> bool:
+    """choose-an-account 页：点击当前已登录账号（含目标邮箱），进入授权页。"""
+    if not _is_choose_account_page(page):
+        return False
+
+    email_lower = email.strip().lower()
+    log(f"choose-an-account 页，选择当前账号: {email}")
+    _pause(0)
+
+    def left_choose_or_consent() -> bool:
+        return (
+            not _is_choose_account_page(page)
+            or _is_codex_consent_page(page)
+            or _is_callback_url(page.url)
+        )
+
+    try:
+        email_loc = page.get_by_text(email, exact=False)
+        for i in range(min(email_loc.count(), 10)):
+            el = email_loc.nth(i)
+            if not el.is_visible():
+                continue
+            label = _control_label(el)
+            if CHOOSE_ANOTHER_ACCOUNT_RE.search(label) or CHOOSE_ACCOUNT_EXCLUDE_RE.search(label):
+                continue
+            if email_lower not in label.lower():
+                continue
+            for xpath in (
+                "xpath=ancestor-or-self::button[1]",
+                "xpath=ancestor-or-self::a[1]",
+                "xpath=ancestor-or-self::*[@role='button'][1]",
+                "xpath=ancestor-or-self::*[@role='link'][1]",
+            ):
+                try:
+                    target = el.locator(xpath)
+                    if target.count() > 0 and target.first.is_visible():
+                        target.first.click(timeout=timeout)
+                        _pause(0)
+                        if _poll_until(left_choose_or_consent, timeout_sec=12):
+                            log(f"已选择账号: {label[:64]}")
+                            return True
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                el.click(timeout=timeout)
+                _pause(0)
+                if _poll_until(left_choose_or_consent, timeout_sec=12):
+                    log(f"已选择账号: {label[:64]}")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        for sel in ("button", "a", "[role='button']", "[role='link']"):
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 20)):
+                el = loc.nth(i)
+                if not el.is_visible():
+                    continue
+                label = _control_label(el)
+                if not label or email_lower not in label.lower():
+                    continue
+                if CHOOSE_ANOTHER_ACCOUNT_RE.search(label) or CHOOSE_ACCOUNT_EXCLUDE_RE.search(label):
+                    continue
+                el.click(timeout=timeout)
+                _pause(0)
+                if _poll_until(left_choose_or_consent, timeout_sec=12):
+                    log(f"已选择账号: {label[:64]}")
+                    return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    log(f"choose-an-account 未找到当前账号 {email}")
+    return False
 
 
 def _click_text(page: Page, texts: list[str], timeout: int = 8000) -> bool:
@@ -1303,7 +1438,7 @@ def _fill_password(page: Page, password: str) -> bool:
     if not submitted:
         if not _click_text(page, ["继续", "Continue", "Log in", "登录"], timeout=3000):
             page.keyboard.press("Enter")
-    _pause(0.3)
+    _pause(0)
     return True
 
 
@@ -1339,7 +1474,38 @@ def _fill_split_otp_inputs(page: Page, code: str) -> bool:
     return True
 
 
-def _fill_otp(page: Page, mailapi_url: str) -> bool:
+_last_otp_code_tried: str | None = None
+
+
+def _fetch_otp_code_from_mail(
+    mailapi_url: str,
+    *,
+    refetch: bool = False,
+    ignore_codes: set[str] | frozenset[str] | None = None,
+) -> str:
+    """获取邮箱验证码。
+
+    首次：等待 OTP_PAGE_DELAY_SEC 后直接使用邮箱中的验证码。
+    重新获取（填错后）：忽略已用过的码，等待后再轮询新码。
+    """
+    ignore: set[str] = set(ignore_codes or ())
+    baseline = _peek_email_code(mailapi_url)
+    if baseline:
+        if refetch:
+            ignore.add(baseline)
+            log(f"重新获取验证码，忽略已用过的码: {baseline}")
+        else:
+            log(f"邮箱已有验证码: {baseline}，等待 {OTP_PAGE_DELAY_SEC}s 后使用")
+
+    return fetch_email_code(
+        mailapi_url,
+        initial_delay=OTP_PAGE_DELAY_SEC,
+        ignore_codes=ignore if refetch else None,
+    )
+
+
+def _fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> bool:
+    global _last_otp_code_tried
     if _is_codex_consent_page(page) or _is_callback_url(page.url):
         log("验证码已完成，已进入授权/回调页")
         return True
@@ -1355,7 +1521,15 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
         return False
 
     log("轮询 mailapi 获取验证码…")
-    code = fetch_email_code(mailapi_url)
+    tried_ignore: set[str] = set()
+    if refetch and _last_otp_code_tried:
+        tried_ignore.add(_last_otp_code_tried)
+    code = _fetch_otp_code_from_mail(
+        mailapi_url,
+        refetch=refetch,
+        ignore_codes=tried_ignore or None,
+    )
+    _last_otp_code_tried = code
     _pause()
 
     if _fill_split_otp_inputs(page, code):
@@ -1381,7 +1555,7 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
             log("未找到验证码输入框")
             return False
         _type_chars(otp_input, code)
-        _pause(1.5)
+        _pause(0)
         if _wait_after_otp_submit(page, timeout_sec=6):
             log("验证码输入后已自动进入下一页")
             return True
@@ -1395,7 +1569,7 @@ def _fill_otp(page: Page, mailapi_url: str) -> bool:
         log("未点到「继续」，尝试 Enter")
         page.keyboard.press("Enter")
         _pause()
-    _pause(1.5)
+    _pause(0)
 
     if _is_codex_consent_page(page) or _is_callback_url(page.url):
         log("已进入授权/回调页")
@@ -1450,7 +1624,7 @@ def _advance_mfa_to_email_otp(page: Page) -> bool:
     if not _click_text(page, BTN_MFA_TRY_OTHER, timeout=8000):
         log("未找到「尝试其他方法」")
         return False
-    _pause(2)
+    _pause(0)
 
     if _is_mfa_email_otp_page(page):
         return True
@@ -1462,7 +1636,7 @@ def _advance_mfa_to_email_otp(page: Page) -> bool:
     if not _click_text(page, BTN_MFA_EMAIL, timeout=8000):
         log("未找到「电子邮件」验证方式")
         return False
-    _pause(1)
+    _pause(0)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=10000)
     except Exception:  # noqa: BLE001
@@ -1478,12 +1652,25 @@ def _process_otp_step(page: Page, mailapi_url: str, otp_submitted: bool) -> bool
     if otp_submitted:
         if _is_codex_consent_page(page) or not _is_otp_code_page(page):
             return False
+        if _detect_otp_error(page):
+            log(f"验证码错误，{OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
+            if _fill_otp(page, mailapi_url, refetch=True):
+                if not _is_otp_code_page(page) or _is_codex_consent_page(page):
+                    return False
+                return True
+            return True
         log("验证码已填，重试点击「继续」…")
         _click_otp_submit(page)
-        _pause(1.5)
+        _pause(0)
         if _wait_after_otp_submit(page, timeout_sec=15):
             return False
         if _is_otp_code_page(page):
+            if _detect_otp_error(page):
+                log(f"验证码错误，{OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
+                if _fill_otp(page, mailapi_url, refetch=True):
+                    if not _is_otp_code_page(page) or _is_codex_consent_page(page):
+                        return False
+                    return True
             _check_otp_error_or_raise(page)
         return True
     if _fill_otp(page, mailapi_url):
@@ -1501,12 +1688,13 @@ def _advance_login_flow(
     *,
     auth_path: Path | None = None,
     timeout_sec: int = 180,
+    use_current_account: bool = False,
 ) -> None:
     """
     严格按 URL 执行操作，避免在错误页面点击「继续」：
 
     log-in-or-create-account / log-in → 填邮箱
-    choose-an-account → 登录至另一个账户
+    choose-an-account → 登录至另一个账户（或 use_current_account 时选当前账号）
     log-in/password → 填密码
     email-verification / mfa email-otp → 填验证码 + 继续
     mfa-challenge → 尝试其他方法 → 电子邮件 → email-otp
@@ -1544,7 +1732,7 @@ def _advance_login_flow(
             otp_submitted = False
             if not _advance_mfa_to_email_otp(page):
                 raise MfaChallengeError(f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}")
-            _pause(2)
+            _pause(0)
             continue
 
         if kind == "login_or_create":
@@ -1552,7 +1740,7 @@ def _advance_login_flow(
             if _handle_login_or_create_email(page, email):
                 login_email_done = True
                 _wait_after_login_email(page)
-            _pause(1)
+            _pause(0)
             continue
 
         if kind == "choose_account":
@@ -1560,23 +1748,32 @@ def _advance_login_flow(
             choose_account_tries += 1
             if choose_account_tries > 6:
                 raise RuntimeError(
-                    "choose-an-account 页多次未能点击「登录至另一个账户」，请检查页面文案或手动登录"
+                    "choose-an-account 页多次未能选择账号，请检查页面文案或手动登录"
                 )
-            if _handle_choose_account(page):
+            if use_current_account:
+                if _click_current_account_on_choose_page(page, email):
+                    choose_account_tries = 0
+                    _wait_known_auth_page(page, timeout_sec=15)
+            elif _handle_choose_account(page):
                 choose_account_tries = 0
                 _wait_known_auth_page(page, timeout_sec=15)
-            _pause(2)
+            _pause(0)
             continue
+
+        if kind == "phone_verification":
+            raise PhoneVerificationError(
+                f"OAuth 遇到手机验证页: {page.url.split('?', 1)[0]}"
+            )
 
         if kind == "login":
             otp_submitted = False
             if login_email_done or _password_visible(page) or _is_login_password_page(page):
-                _pause(1)
+                _pause(0)
                 continue
             if _handle_login_email(page, email):
                 login_email_done = True
                 _wait_after_login_email(page)
-            _pause(1)
+            _pause(0)
             continue
 
         if kind == "password":
@@ -1593,10 +1790,10 @@ def _advance_login_flow(
 
         if kind in ("email_verification", "mfa_email_otp"):
             if _is_codex_consent_page(page):
-                _pause(1)
+                _pause(0)
                 continue
             otp_submitted = _process_otp_step(page, mailapi_url, otp_submitted)
-            _pause(1)
+            _pause(0)
             continue
 
         if kind == "consent":
@@ -1615,13 +1812,13 @@ def _advance_login_flow(
                     log("已离开 Codex 授权页")
                     continue
                 log("授权后等待 OAuth 完成超时，重试…")
-                _pause(2)
+                _pause(0)
             else:
                 if auth_path is not None and _auth_file_ready(auth_path):
                     log("codex login 已写入 auth.json，结束浏览器登录流程")
                     return
                 log("codex/consent 授权页未点到「继续」，重试…")
-                _pause(2)
+                _pause(0)
             continue
 
         # OAuth 账户选择 / authorize 等中间页：先点「登录另一个账户」
@@ -1634,16 +1831,22 @@ def _advance_login_flow(
                     raise MfaChallengeError(
                         f"MFA 无法切换至邮箱验证: {page.url.split('?', 1)[0]}"
                     )
-            _pause(2)
+            _pause(0)
             continue
 
-        if _try_another_account(page):
+        if use_current_account and _is_choose_account_page(page):
+            if _click_current_account_on_choose_page(page, email):
+                _wait_known_auth_page(page, timeout_sec=15)
+            _pause(0)
+            continue
+
+        if not use_current_account and _try_another_account(page):
             _wait_known_auth_page(page, timeout_sec=15)
             continue
 
         log(f"等待已知登录页… {page.url[:90]}")
         _wait_known_auth_page(page, timeout_sec=10)
-        _pause(1)
+        _pause(0)
 
     if auth_path is not None and _auth_file_ready(auth_path):
         log("codex login 已写入 auth.json")
