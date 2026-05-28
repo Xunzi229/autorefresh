@@ -57,7 +57,7 @@ REFRESHED_MARK = "已刷新"
 ABANDONED_MARK = "已废弃"
 ABNORMAL_MARK = "异常"
 ACTION_DELAY_SEC = 0  # 浏览器操作之间的间隔（秒）
-OTP_PAGE_DELAY_SEC = 5  # 进入验证码页后、首次拉取邮箱前的等待（秒）
+OTP_PAGE_DELAY_SEC = 5  # 验证码错误后、重新从邮箱拉取前的等待（秒）
 OTP_MAIL_POLL_INTERVAL_SEC = 5  # mailapi 轮询间隔（秒）
 ACCOUNT_GAP_SEC = 10  # 每个账号刷新之间的间隔（秒）
 TYPE_CHAR_DELAY_MS = 0  # 逐字符输入间隔（毫秒）
@@ -118,6 +118,17 @@ OTP_ERROR_RE = re.compile(
     r"enter a valid code|try again",
     re.I,
 )
+OTP_PAGE_GLITCH_RE = re.compile(
+    r"出错了|something went wrong|went wrong|请稍后再试|请稍后重试|"
+    r"error occurred|an error occurred|unable to|couldn.t|failed to verify",
+    re.I,
+)
+BTN_OTP_RETRY = ["重试", "Retry", "Try again", "再试一次", "重新尝试"]
+BTN_OTP_RESEND = [
+    "重新获取验证码", "重新发送验证码", "重新发送", "再次发送验证码", "再次发送",
+    "Resend code", "Resend email", "Resend", "Send again", "Get a new code",
+    "Request a new code", "Send new code", "Send a new code",
+]
 KNOWN_AUTH_PAGE_URL_RE = re.compile(
     r"auth\.openai\.com/(?:log-in(?:/password|-or-create-account)?|email-verification|mfa-challenge)|"
     r"auth\.openai\.com/sign-in-with-chatgpt/codex/consent|"
@@ -735,6 +746,101 @@ def _check_otp_error_or_raise(page: Page) -> None:
     err = _detect_otp_error(page)
     if err:
         raise AccountAbnormalError(f"邮箱验证码错误: {err}")
+
+
+def _click_button_on_root(root: Any, texts: list[str], *, timeout: int = 8000) -> bool:
+    for text in texts:
+        for loc in (
+            root.get_by_role("button", name=text, exact=True),
+            root.get_by_role("button", name=re.compile(re.escape(text), re.I)),
+            root.get_by_role("link", name=text, exact=True),
+            root.get_by_role("link", name=re.compile(re.escape(text), re.I)),
+            root.locator(f'button:has-text("{text}")'),
+            root.get_by_text(text, exact=True),
+        ):
+            try:
+                el = loc.first
+                if el.is_visible(timeout=1500):
+                    el.click(timeout=timeout)
+                    _pause(0)
+                    log(f"已点击: {text}")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+    return False
+
+
+def _otp_retry_button_visible(root: Any) -> bool:
+    for text in BTN_OTP_RETRY:
+        try:
+            loc = root.get_by_role("button", name=re.compile(re.escape(text), re.I))
+            if loc.count() > 0 and loc.first.is_visible(timeout=500):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            loc = root.get_by_text(text, exact=True)
+            if loc.count() > 0 and loc.first.is_visible(timeout=500):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
+def _detect_otp_page_glitch(root: Any) -> bool:
+    """临时出错（非验证码错误）：页面有「重试」按钮。"""
+    if _detect_otp_error(root):
+        return False
+    return _otp_retry_button_visible(root)
+
+
+def _click_otp_retry(root: Any) -> bool:
+    log("验证码页出错，点击「重试」…")
+    return _click_button_on_root(root, BTN_OTP_RETRY)
+
+
+def _click_otp_resend(root: Any) -> bool:
+    log("点击「重新获取验证码」…")
+    return _click_button_on_root(root, BTN_OTP_RESEND)
+
+
+def _clear_otp_inputs(root: Any) -> None:
+    loc = root.locator(
+        'input[inputmode="numeric"], input[type="tel"], input[autocomplete="one-time-code"], '
+        'input[name="code"], input[type="text"]'
+    )
+    try:
+        count = loc.count()
+    except Exception:  # noqa: BLE001
+        return
+    for i in range(min(count, 8)):
+        try:
+            box = loc.nth(i)
+            if box.is_visible(timeout=500):
+                box.fill("")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _refill_otp_code(root: Any, code: str) -> bool:
+    _clear_otp_inputs(root)
+    if _fill_split_otp_inputs(root, code):
+        return True
+    otp_input = _first_visible(
+        root,
+        [
+            'input[inputmode="numeric"]',
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[type="tel"]',
+            'input[type="text"]',
+        ],
+        timeout=5000,
+    )
+    if not otp_input:
+        return False
+    _type_chars(otp_input, code)
+    return True
 
 
 def _login_page_kind(page: Page) -> str:
@@ -1485,23 +1591,105 @@ def _fetch_otp_code_from_mail(
 ) -> str:
     """获取邮箱验证码。
 
-    首次：等待 OTP_PAGE_DELAY_SEC 后直接使用邮箱中的验证码。
-    重新获取（填错后）：忽略已用过的码，等待后再轮询新码。
+    首次：立即从邮箱读取并使用。
+    验证码错误后重新获取：等待 OTP_PAGE_DELAY_SEC，忽略旧码后轮询新码。
     """
     ignore: set[str] = set(ignore_codes or ())
-    baseline = _peek_email_code(mailapi_url)
-    if baseline:
-        if refetch:
+    if refetch:
+        baseline = _peek_email_code(mailapi_url)
+        if baseline:
             ignore.add(baseline)
             log(f"重新获取验证码，忽略已用过的码: {baseline}")
-        else:
-            log(f"邮箱已有验证码: {baseline}，等待 {OTP_PAGE_DELAY_SEC}s 后使用")
+        log(f"验证码错误，等待 {OTP_PAGE_DELAY_SEC}s 后从邮箱重新获取…")
+        return fetch_email_code(
+            mailapi_url,
+            initial_delay=OTP_PAGE_DELAY_SEC,
+            ignore_codes=ignore or None,
+        )
 
+    baseline = _peek_email_code(mailapi_url)
+    if baseline:
+        log(f"邮箱已有验证码: {baseline}，立即使用")
+    else:
+        log("邮箱暂无验证码，轮询 mailapi…")
     return fetch_email_code(
         mailapi_url,
-        initial_delay=OTP_PAGE_DELAY_SEC,
-        ignore_codes=ignore if refetch else None,
+        initial_delay=0,
+        ignore_codes=None,
     )
+
+
+def _handle_otp_after_submit(
+    root: Any,
+    mailapi_url: str,
+    *,
+    submit_fn: Callable[[], bool],
+    is_done: Callable[[], bool],
+    max_rounds: int = 4,
+) -> bool:
+    """提交验证码后仍在 OTP 页：验证码错误则重新获取；临时出错则重试并复用原码。"""
+    global _last_otp_code_tried
+
+    for _ in range(max_rounds):
+        if is_done():
+            return True
+
+        _poll_until(
+            lambda: is_done() or _detect_otp_error(root) is not None or _detect_otp_page_glitch(root),
+            timeout_sec=6,
+        )
+        if is_done():
+            return True
+
+        wrong_code = _detect_otp_error(root)
+        if wrong_code:
+            log(f"验证码不正确: {wrong_code}")
+            if not _click_otp_resend(root):
+                log("未找到「重新获取验证码」，尝试「重试」…")
+                _click_otp_retry(root)
+            tried_ignore: set[str] = set()
+            if _last_otp_code_tried:
+                tried_ignore.add(_last_otp_code_tried)
+            code = _fetch_otp_code_from_mail(
+                mailapi_url,
+                refetch=True,
+                ignore_codes=tried_ignore or None,
+            )
+            _last_otp_code_tried = code
+            if not _refill_otp_code(root, code):
+                log("重新填写验证码失败")
+                return False
+            if not submit_fn():
+                try:
+                    root.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
+
+        if _detect_otp_page_glitch(root):
+            if not _click_otp_retry(root):
+                log("未找到「重试」按钮")
+                return False
+            _poll_until(lambda: _otp_visible(root), timeout_sec=12)
+            if not _last_otp_code_tried:
+                log("无已保存验证码可重用")
+                return False
+            log(f"重新输入验证码: {_last_otp_code_tried}")
+            if not _refill_otp_code(root, _last_otp_code_tried):
+                log("重新填写验证码失败")
+                return False
+            if not submit_fn():
+                try:
+                    root.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
+
+        if _poll_until(is_done, timeout_sec=8):
+            return True
+        break
+
+    return is_done()
 
 
 def _fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> bool:
@@ -1569,20 +1757,25 @@ def _fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> bool:
         log("未点到「继续」，尝试 Enter")
         page.keyboard.press("Enter")
         _pause()
-    _pause(0)
 
-    if _is_codex_consent_page(page) or _is_callback_url(page.url):
-        log("已进入授权/回调页")
+    def _otp_done() -> bool:
+        if _is_codex_consent_page(page) or _is_callback_url(page.url):
+            return True
+        return not _is_otp_code_page(page)
+
+    if _handle_otp_after_submit(
+        page,
+        mailapi_url,
+        submit_fn=lambda: _click_otp_submit(page),
+        is_done=_otp_done,
+    ):
         return True
 
     if _is_otp_code_page(page):
-        _check_otp_error_or_raise(page)
-
-    if _wait_after_otp_submit(page, timeout_sec=20):
-        return True
-
-    if _is_otp_code_page(page):
-        _check_otp_error_or_raise(page)
+        if _detect_otp_error(page):
+            return True
+        if _detect_otp_page_glitch(page):
+            return True
         log("提交后仍在验证码页")
     return True
 
@@ -1649,32 +1842,26 @@ def _process_otp_step(page: Page, mailapi_url: str, otp_submitted: bool) -> bool
     """处理验证码页（email-verification / mfa email-otp），返回是否已提交过验证码。"""
     if _is_codex_consent_page(page) or _is_callback_url(page.url):
         return False
-    if otp_submitted:
-        if _is_codex_consent_page(page) or not _is_otp_code_page(page):
-            return False
-        if _detect_otp_error(page):
-            log(f"验证码错误，{OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
-            if _fill_otp(page, mailapi_url, refetch=True):
-                if not _is_otp_code_page(page) or _is_codex_consent_page(page):
-                    return False
-                return True
+
+    def _otp_done() -> bool:
+        if _is_codex_consent_page(page) or _is_callback_url(page.url):
             return True
-        log("验证码已填，重试点击「继续」…")
-        _click_otp_submit(page)
-        _pause(0)
-        if _wait_after_otp_submit(page, timeout_sec=15):
+        return not _is_otp_code_page(page)
+
+    if otp_submitted:
+        if _otp_done():
             return False
-        if _is_otp_code_page(page):
-            if _detect_otp_error(page):
-                log(f"验证码错误，{OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
-                if _fill_otp(page, mailapi_url, refetch=True):
-                    if not _is_otp_code_page(page) or _is_codex_consent_page(page):
-                        return False
-                    return True
-            _check_otp_error_or_raise(page)
+        if _handle_otp_after_submit(
+            page,
+            mailapi_url,
+            submit_fn=lambda: _click_otp_submit(page),
+            is_done=_otp_done,
+        ):
+            return False if _otp_done() else True
         return True
+
     if _fill_otp(page, mailapi_url):
-        if not _is_otp_code_page(page) or _is_codex_consent_page(page):
+        if _otp_done():
             return False
         return True
     return otp_submitted

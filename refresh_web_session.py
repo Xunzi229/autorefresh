@@ -532,7 +532,15 @@ def _web_fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> boo
         return False
 
     rt.log("轮询 mailapi 获取邮箱验证码…")
-    code = rt._fetch_otp_code_from_mail(mailapi_url, refetch=refetch)
+    tried_ignore: set[str] = set()
+    if refetch and rt._last_otp_code_tried:
+        tried_ignore.add(rt._last_otp_code_tried)
+    code = rt._fetch_otp_code_from_mail(
+        mailapi_url,
+        refetch=refetch,
+        ignore_codes=tried_ignore or None,
+    )
+    rt._last_otp_code_tried = code
     rt._pause()
 
     if rt._fill_split_otp_inputs(root, code):
@@ -565,13 +573,23 @@ def _web_fill_otp(page: Page, mailapi_url: str, *, refetch: bool = False) -> boo
         rt.log("未点到「继续」，尝试 Enter")
         root.keyboard.press("Enter")
         rt._pause()
-    rt._pause(0)
 
-    if _web_wait_after_otp_submit(page, root, timeout_sec=20):
+    def _otp_done() -> bool:
+        if _has_session_cookie(page):
+            return True
+        return not _is_still_on_otp_page(page, root)
+
+    if rt._handle_otp_after_submit(
+        root,
+        mailapi_url,
+        submit_fn=lambda: _web_click_otp_submit(root, page),
+        is_done=_otp_done,
+    ):
         return True
 
     if _is_still_on_otp_page(page, root):
-        rt._check_otp_error_or_raise(root)
+        if rt._detect_otp_error(root) or rt._detect_otp_page_glitch(root):
+            return True
         rt.log("提交后仍在 email-verification 页")
     return True
 
@@ -590,37 +608,30 @@ def _web_process_otp_step(page: Page, mailapi_url: str, otp_submitted: bool) -> 
     if not _is_email_verification_any(page) and not _otp_visible_any(page):
         return otp_submitted
 
-    if otp_submitted:
-        root = _primary_otp_root(page)
-        if root is None or not _is_still_on_otp_page(page, root):
-            return False
-        if rt._detect_otp_error(root):
-            rt.log(f"验证码错误，{rt.OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
-            if _web_fill_otp(page, mailapi_url, refetch=True):
-                root = _primary_otp_root(page)
-                if root is None or not _is_still_on_otp_page(page, root):
-                    return False
-                return True
+    root = _primary_otp_root(page)
+    if root is None:
+        return otp_submitted
+
+    def _otp_done() -> bool:
+        if _has_session_cookie(page):
             return True
-        rt.log("验证码已填，重试点击「继续」…")
-        _web_click_otp_submit(root, page)
-        rt._pause(0)
-        if _web_wait_after_otp_submit(page, root, timeout_sec=15):
+        return not _is_still_on_otp_page(page, root)
+
+    if otp_submitted:
+        if _otp_done():
             return False
-        if _is_still_on_otp_page(page, root):
-            if rt._detect_otp_error(root):
-                rt.log(f"验证码错误，{rt.OTP_PAGE_DELAY_SEC}s 后重新从邮箱获取…")
-                if _web_fill_otp(page, mailapi_url, refetch=True):
-                    root = _primary_otp_root(page)
-                    if root is None or not _is_still_on_otp_page(page, root):
-                        return False
-                    return True
-            rt._check_otp_error_or_raise(root)
+        if rt._handle_otp_after_submit(
+            root,
+            mailapi_url,
+            submit_fn=lambda: _web_click_otp_submit(root, page),
+            is_done=_otp_done,
+        ):
+            return False if _otp_done() else True
         return True
 
     if _web_fill_otp(page, mailapi_url):
         root = _primary_otp_root(page)
-        if root is None or not _is_still_on_otp_page(page, root):
+        if root is None or _otp_done():
             return False
         return True
     return otp_submitted
