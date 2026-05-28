@@ -1926,7 +1926,7 @@ def save_accounts(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _now_cn_iso() -> str:
-    return datetime.now(TZ_CN).strftime("%Y-%m-%dT%H:%M:%S%z").replace("+0800", "+08:00")
+    return datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S +0800")
 
 
 def _jwt_exp_cn_iso(token: str) -> str | None:
@@ -1934,9 +1934,7 @@ def _jwt_exp_cn_iso(token: str) -> str | None:
         data = _jwt_payload(token)
         exp = data.get("exp")
         if exp:
-            return datetime.fromtimestamp(int(exp), TZ_CN).strftime("%Y-%m-%dT%H:%M:%S%z").replace(
-                "+0800", "+08:00"
-            )
+            return datetime.fromtimestamp(int(exp), TZ_CN).strftime("%Y-%m-%d %H:%M:%S +0800")
     except Exception:  # noqa: BLE001
         pass
     return None
