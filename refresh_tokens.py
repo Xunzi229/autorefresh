@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 
 import requests
 
+import cli_proxy_io
+
 try:
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import Page, sync_playwright
@@ -107,6 +109,10 @@ MFA_EMAIL_OTP_URL_RE = re.compile(
 )
 PHONE_VERIFICATION_URL_RE = re.compile(
     r"auth\.openai\.com/phone-verification",
+    re.I,
+)
+PHONE_OTP_URL_RE = re.compile(
+    r"auth\.openai\.com/phone-otp",
     re.I,
 )
 OTP_ERROR_RE = re.compile(
@@ -690,6 +696,18 @@ def _is_phone_verification_page(page: Page) -> bool:
     )
 
 
+def _is_phone_otp_page(page: Page) -> bool:
+    """https://auth.openai.com/phone-otp/... 含 select-channel 等"""
+    url = page.url.lower().split("?", 1)[0]
+    path = _auth_path(page.url).lower()
+    return "phone-otp" in url or path.startswith("/phone-otp")
+
+
+def _is_phone_auth_block_page(page: Page) -> bool:
+    """OAuth 流程遇到手机验证/手机 OTP，需改走 session API。"""
+    return _is_phone_verification_page(page) or _is_phone_otp_page(page)
+
+
 def _is_otp_code_page(page: Page) -> bool:
     return _is_email_verification_page(page) or _is_mfa_email_otp_page(page)
 
@@ -699,7 +717,7 @@ class MfaChallengeError(Exception):
 
 
 class PhoneVerificationError(Exception):
-    """OAuth 流程遇到手机验证，需改用 session API 获取 access_token。"""
+    """OAuth 流程遇到手机验证/手机 OTP，需改用 session API 获取 access_token。"""
 
 
 class AccountAbnormalError(Exception):
@@ -860,7 +878,7 @@ def _login_page_kind(page: Page) -> str:
         return "password"
     if _is_choose_account_page(page):
         return "choose_account"
-    if _is_phone_verification_page(page):
+    if _is_phone_auth_block_page(page):
         return "phone_verification"
     if _is_login_or_create_page(page):
         return "login_or_create"
@@ -1949,7 +1967,7 @@ def _advance_login_flow(
 
         if kind == "phone_verification":
             raise PhoneVerificationError(
-                f"OAuth 遇到手机验证页: {page.url.split('?', 1)[0]}"
+                f"OAuth 遇到手机验证/OTP 页: {page.url.split('?', 1)[0]}"
             )
 
         if kind == "login":
@@ -2204,18 +2222,14 @@ def load_refresh_token_for_account(
     account: dict[str, Any],
     proxy_dir: Path = CLI_PROXY_DIR,
 ) -> str | None:
-    """优先 ~/.cli-proxy-api/<邮箱>.json，其次 accounts 中的 refresh_token。"""
+    """优先 ~/.cli-proxy-api 中 email 字段匹配的 JSON，其次 accounts 中的 refresh_token。"""
     email = str(account.get("email", "")).strip()
     if email:
-        proxy_path = proxy_dir / f"{email}.json"
-        if proxy_path.exists():
-            try:
-                data = _load_json_file(proxy_path)
-                rt = str(data.get("refresh_token", "")).strip()
-                if rt:
-                    return rt
-            except json.JSONDecodeError as exc:
-                log(f"读取 {proxy_path.name} 失败: {exc}")
+        data, path = cli_proxy_io.load_cli_proxy_by_email(email, proxy_dir)
+        if path is not None and data:
+            rt = str(data.get("refresh_token", "")).strip()
+            if rt:
+                return rt
 
     rt = str(account.get("refresh_token", "")).strip()
     return rt or None
@@ -2341,13 +2355,13 @@ def sync_cli_proxy_token(
     account: dict[str, Any],
     proxy_dir: Path = CLI_PROXY_DIR,
 ) -> Path:
-    """刷新后同步 ~/.cli-proxy-api/<邮箱>.json 原件 token。"""
+    """刷新后同步 ~/.cli-proxy-api 原件 token（按 JSON 内 email 定位文件）。"""
     email = str(account.get("email", "")).strip()
     if not email:
         raise ValueError("账号缺少 email")
 
     proxy_dir.mkdir(parents=True, exist_ok=True)
-    path = proxy_dir / f"{email}.json"
+    path = cli_proxy_io.resolve_cli_proxy_path(email, proxy_dir)
 
     existing: dict[str, Any] = {}
     if path.exists():
@@ -2411,10 +2425,10 @@ def mark_cli_proxy_disabled(
     email: str,
     proxy_dir: Path = CLI_PROXY_DIR,
 ) -> None:
-    """cli-proxy 原件标记 disabled=true。"""
-    path = proxy_dir / f"{email.strip()}.json"
-    if not path.exists():
-        log(f"cli-proxy 原件不存在，跳过 disabled: {path.name}")
+    """cli-proxy 原件标记 disabled=true（按 JSON 内 email 定位文件）。"""
+    path = cli_proxy_io.find_cli_proxy_file(email, proxy_dir)
+    if path is None:
+        log(f"cli-proxy 未找到 email={email} 的原件，跳过 disabled")
         return
     try:
         data = _load_json_file(path)
@@ -2668,7 +2682,7 @@ def main() -> int:
     parser.add_argument(
         "--no-cli-proxy",
         action="store_true",
-        help="不同步 ~/.cli-proxy-api/<邮箱>.json",
+        help="不同步 ~/.cli-proxy-api 原件（按 JSON 内 email 匹配）",
     )
     parser.add_argument(
         "--force-browser",

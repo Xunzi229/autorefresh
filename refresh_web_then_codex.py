@@ -2,7 +2,7 @@
 """先 ChatGPT 网页登录，再本地 OAuth 回调服务完成 Codex 授权，回写 accounts 等。
 
 刷新策略（默认）：
-1. 检查 ~/.cli-proxy-api/<邮箱>.json 的 access_token 是否仍有效 → 有效则仅更新「已刷新」
+1. 检查 ~/.cli-proxy-api 中 email 字段匹配的 JSON 的 access_token 是否仍有效 → 有效则仅更新「已刷新」
 2. access_token 失效 → 用 refresh_token API 刷新
 3. refresh_token 也失效 → 网页登录 + 本地 OAuth 回调换 token
 
@@ -37,6 +37,7 @@ except ImportError:
     raise
 
 import refresh_tokens as rt
+import cli_proxy_io
 import refresh_web_session as web
 from fetch_quota import fetch_openai_usage, is_token_invalid_error
 
@@ -56,17 +57,12 @@ EXPIRED_DT_FORMATS = (
 )
 
 
-def _cli_proxy_path(email: str, proxy_dir: Path) -> Path:
-    return proxy_dir / f"{email.strip()}.json"
-
-
 def load_cli_proxy_data(email: str, proxy_dir: Path) -> dict[str, Any]:
-    path = _cli_proxy_path(email, proxy_dir)
-    if not path.exists():
+    path = cli_proxy_io.find_cli_proxy_file(email, proxy_dir)
+    if path is None:
         return {}
     try:
-        data = rt._load_json_file(path)
-        return data if isinstance(data, dict) else {}
+        return cli_proxy_io.load_cli_proxy_json(path)
     except json.JSONDecodeError as exc:
         rt.log(f"读取 {path.name} 失败: {exc}")
         return {}
@@ -318,8 +314,8 @@ def _build_auth_from_session(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _session_auth_fallback(page: Any, auth_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    """OAuth 遇到手机验证时，改用 session API 获取 token 并写入 auth 文件。"""
-    rt.log("OAuth 遇到手机验证，跳过 OAuth，改用 session API 获取 access_token…")
+    """OAuth 遇到手机验证/手机 OTP 时，改用 session API 获取 token 并写入 auth 文件。"""
+    rt.log("OAuth 遇到手机验证/OTP，跳过 OAuth，改用 session API 获取 access_token…")
     session = web.get_session_data(page, navigate_fallback=True)
     if not session.get("accessToken"):
         raise RuntimeError("session API 未返回 accessToken")
@@ -545,13 +541,13 @@ def _run_codex_oauth_on_page(
     if rt._is_choose_account_page(page):
         rt._click_current_account_on_choose_page(page, email)
         rt._pause(0)
-        if rt._is_phone_verification_page(page):
+        if rt._is_phone_auth_block_page(page):
             _session_auth_fallback(page, auth_path)
             return False
     elif not rt._is_codex_consent_page(page) and not rt._is_callback_url(page.url):
         rt.log("OAuth 页未在 choose-an-account，继续后续流程")
 
-    if rt._is_phone_verification_page(page):
+    if rt._is_phone_auth_block_page(page):
         _session_auth_fallback(page, auth_path)
         return False
 

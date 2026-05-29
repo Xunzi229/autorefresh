@@ -15,6 +15,8 @@ from typing import Any
 
 import requests
 
+import cli_proxy_io
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CLI_PROXY_DIR = Path.home() / ".cli-proxy-api"
 DEFAULT_NO_QUOTA = SCRIPT_DIR / "no_quota.txt"
@@ -69,7 +71,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def list_account_files(cli_dir: Path) -> list[Path]:
-    return sorted(p for p in cli_dir.glob("*.json") if p.is_file())
+    return cli_proxy_io.list_cli_proxy_files(cli_dir)
 
 
 def build_proxies(proxy_url: str | None) -> dict[str, str] | None:
@@ -342,7 +344,10 @@ def process_account(
         log(f"跳过 {path.name}: JSON 解析失败 ({exc})")
         return "skip"
 
-    email = str(account.get("email") or path.stem).strip()
+    email = str(account.get("email") or "").strip()
+    if not email:
+        log(f"跳过 {path.name}: JSON 缺少 email 字段")
+        return "skip"
     email_key = email.lower()
     no_quota_record = no_quota_records.get(email_key)
     recheck = no_quota_record is not None and should_recheck_no_quota(no_quota_record)
@@ -456,7 +461,16 @@ def main() -> int:
     files = list_account_files(cli_dir)
     if args.email:
         wanted = {e.strip().lower() for e in args.email}
-        files = [p for p in files if _load_json(p).get("email", p.stem).lower() in wanted or p.stem.lower() in wanted]
+        filtered: list[Path] = []
+        for p in files:
+            try:
+                data = _load_json(p)
+            except json.JSONDecodeError:
+                continue
+            file_email = cli_proxy_io.email_from_proxy_data(data)
+            if file_email and cli_proxy_io.normalize_email(file_email) in wanted:
+                filtered.append(p)
+        files = filtered
 
     if not files:
         log("未找到账号 JSON 文件")
